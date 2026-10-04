@@ -22,9 +22,9 @@
 
 ## What Commander Does
 
-Hemp0x Commander is a non-custodial desktop app for the Hemp0x blockchain. It controls bundled Hemp0x Core Next binaries through local authenticated RPC, so your wallet files and vault files stay on your machine.
+Hemp0x Commander is a non-custodial desktop app for the Hemp0x and Ravencoin blockchains. It controls bundled Hemp0x Core Next and Ravencoin Core binaries through local authenticated RPC, so your wallet files and vault files stay on your machine.
 
-Commander 2.0 is a major rebuild. It adds portable Hemp0x Vault wallets, Core Next 4.8 integration, local chain tools, H0XC chat support, wallet consolidation, a local explorer, and smarter node configuration.
+Commander 2.1 is a major update. It adds Ravencoin integration, decentralized Atomic Swaps, portable Hemp0x Vault wallets, Core Next 4.8 integration, local chain tools, H0XC chat support, wallet consolidation, a local explorer, and smarter node configuration.
 
 ## Commander 2.1.0 Highlights
 
@@ -99,15 +99,15 @@ Commander is non-custodial. That means you control the files and you are respons
 - Verify destination addresses before sending.
 - Keep a copy of important config and data directory backups before repair or reindex operations.
 
-## Core Next and RPC
+## Core Daemons and RPC
 
-Commander is built for Hemp0x Core Next and talks to it through local RPC. Cookie auth is preferred. If your `hemp.conf` still uses static `rpcuser` and `rpcpassword`, Commander can show guidance for switching back to cookie auth.
+Commander is built for Hemp0x Core Next and Ravencoin Core, and talks to them through local RPC. Cookie auth is preferred. If your `hemp.conf` or `raven.conf` still uses static `rpcuser` and `rpcpassword`, Commander can show guidance for switching back to cookie auth.
 
 Common local files:
 
-- `wallet.dat`: legacy Core wallet file.
+- `wallet.dat`: legacy Core wallet file (for both Hemp0x and Ravencoin).
 - `vault.json`: portable Hemp0x Vault file.
-- `hemp.conf`: Core configuration.
+- `hemp.conf` / `raven.conf`: Core configuration files.
 - `.cookie`: local RPC authentication cookie created by Core while the daemon is running.
 
 ## Building From Source
