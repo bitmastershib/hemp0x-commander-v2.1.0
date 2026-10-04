@@ -23,6 +23,10 @@
   import ViewTools from "./lib/ViewTools.svelte";
   import NotificationCenter from "./lib/ui/NotificationCenter.svelte";
   import VaultUnlockModal from "./lib/ui/VaultUnlockModal.svelte";
+
+  // Ravencoin Multi-Chain Components
+  import ViewRavencoin from "./lib/ravencoin/ViewRavencoin.svelte";
+  import AtomicSwap from "./lib/crosschain/AtomicSwap.svelte";
   import {
     loadWalletPinStatus,
     defaultUnlockMode,
@@ -40,6 +44,7 @@
   import { systemHubSection } from "./lib/stores/systemHub.js";
   import { vaultStatus } from "./stores.js";
   import { APP_VERSION } from "./lib/constants.js";
+  import { initNostr } from "./lib/stores/nostrStore.js";
 
   let coreBusyUntilMs = 0;
   const unsubscribeCoreBusy = coreBusyUntil.subscribe((value) => {
@@ -326,6 +331,7 @@
     closeCleanupComplete = true;
     showClosePrompt = false;
     closeCleanupInProgress = true;
+    try { await invokeWithCloseWatchdog("rvn_stop_node_and_wait", { timeout_ms: 30000 }, 32000, ""); } catch(e) {}
     try {
       await core.invoke("exit_commander");
     } catch {
@@ -843,6 +849,14 @@
         }
         const duration = Number(walletPromptDuration || 60);
         await unlockRuntimeWalletWithPassphrase(walletPromptPass, duration);
+        
+        // Simultaneously unlock the Ravencoin wallet using the same password
+        try {
+          await core.invoke("rvn_wallet_unlock", { passphrase: walletPromptPass, timeout: duration });
+        } catch (e) {
+          console.warn("Ravencoin wallet unlock skipped or failed:", e);
+        }
+
         // After a successful full passphrase unlock, offer to set a device PIN
         // if none is configured. The offer is surfaced via the wallet prompt's
         // success path; the Wallet page also shows Set/Change/Remove PIN.
@@ -1026,6 +1040,9 @@
   onMount(() => {
     tauriReady = true; // Force accurate ready state for UI logic
     systemStore.update((s) => ({ ...s, tauriReady: true }));
+
+    // Initialize Nostr P2P network
+    initNostr().catch(e => console.error("Nostr init failed:", e));
 
     // Show window unconditionally (Anti-Flash)
     setTimeout(async () => {
@@ -1358,6 +1375,19 @@
           {tab}
         </button>
       {/each}
+      
+      <div class="nav-divider" style="width: 1px; height: 20px; background: rgba(255,255,255,0.2); margin: 0 10px; align-self: center;"></div>
+      
+      <button
+        class="tab-btn"
+        class:active={isActive('RVN_DASHBOARD')}
+        type="button"
+        style={isActive('RVN_DASHBOARD') ? "color: #ff6b00; border-bottom: 2px solid #ff6b00;" : ""}
+        on:click={() => setTab('RVN_DASHBOARD')}
+      >
+        <span style="color: #ff6b00; margin-right: 4px;">RVN</span>DASHBOARD
+      </button>
+
     </nav>
 
     <div class="window-controls">
@@ -1833,6 +1863,12 @@
       </div>
     </div>
 
+    <!-- RAVENCOIN VIEWS -->
+    <div class="view-wrapper" class:show={activeTab === "RVN_DASHBOARD"}>
+      <ViewRavencoin />
+    </div>
+
+
     <!-- FOOTER -->
     <div class="app-footer">
       <a href="https://hemp0x.com" target="_blank" class="footer-link"
@@ -2217,12 +2253,13 @@ rpccookiefile=...</pre>
 
   /* --- HEADER --- */
   .top-bar {
-    height: 60px;
+    min-height: 60px;
+    height: auto;
     position: relative;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0 1.25rem;
+    padding: 0.5rem 1.25rem;
     border-bottom: 1px solid rgba(255, 255, 255, 0.06);
     background: rgba(0, 0, 0, 0.7);
     backdrop-filter: blur(12px);
@@ -2308,9 +2345,9 @@ rpccookiefile=...</pre>
 
   .main-nav {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.25rem;
-    height: 100%;
-    align-items: flex-end;
+    align-items: center;
     position: relative;
     z-index: 60;
     pointer-events: auto;
@@ -2318,9 +2355,14 @@ rpccookiefile=...</pre>
     flex-shrink: 1;
     min-width: 0;
     overflow-x: auto;
+    padding-bottom: 2px;
   }
   .main-nav::-webkit-scrollbar {
-    height: 0;
+    height: 2px;
+  }
+  .main-nav::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 2px;
   }
   .tab-btn {
     pointer-events: auto;
@@ -3651,7 +3693,8 @@ rpccookiefile=...</pre>
 
   @media (max-width: 800px) {
     .top-bar {
-      height: 52px;
+      min-height: 52px;
+      height: auto;
     }
     .app-title {
       font-size: 0.8rem;
@@ -3699,7 +3742,8 @@ rpccookiefile=...</pre>
 
   @media (max-width: 600px) {
     .top-bar {
-      height: 48px;
+      min-height: 48px;
+      height: auto;
       padding: 0 0.5rem;
     }
     .logo {
@@ -3724,7 +3768,8 @@ rpccookiefile=...</pre>
 
   @media (max-height: 700px) {
     .top-bar {
-      height: 52px;
+      min-height: 52px;
+      height: auto;
       padding: 0 1rem;
     }
     .trust-strip {

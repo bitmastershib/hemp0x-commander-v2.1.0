@@ -16,6 +16,31 @@
   </head>
   <body>
     <div id="app"></div>
+    <script>
+      window.onerror = function(msg, url, lineNo, columnNo, error) {
+        var pre = document.createElement('pre');
+        pre.style.color = 'red';
+        pre.style.background = 'white';
+        pre.style.padding = '10px';
+        pre.style.zIndex = '9999';
+        pre.style.position = 'absolute';
+        pre.style.top = '0';
+        pre.textContent = "FATAL ERROR: " + msg + "\n" + url + ":" + lineNo + "\n" + (error && error.stack);
+        document.body.appendChild(pre);
+        return false;
+      };
+      window.addEventListener("unhandledrejection", function(event) {
+        var pre = document.createElement('pre');
+        pre.style.color = 'red';
+        pre.style.background = 'white';
+        pre.style.padding = '10px';
+        pre.style.zIndex = '9999';
+        pre.style.position = 'absolute';
+        pre.style.top = '50px';
+        pre.textContent = "UNHANDLED PROMISE: " + (event.reason && event.reason.stack || event.reason);
+        document.body.appendChild(pre);
+      });
+    </script>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

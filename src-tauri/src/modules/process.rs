@@ -569,7 +569,7 @@ pub fn stop_node_blocking() -> Result<(), String> {
             }
             Ok(())
         }
-        Err(e) if !daemon_process_running() => {
+        Err(_e) if !daemon_process_running() => {
             settle_after_daemon_exit();
             cleanup_stale_runtime_files();
             Ok(())

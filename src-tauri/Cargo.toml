@@ -1,6 +1,6 @@
 [package]
 name = "hemp0x-commander"
-version = "2.0.1"
+version = "2.1.0"
 description = "Hemp0x Commander - secure non-custodial wallet manager for the Hemp0x blockchain"
 authors = ["Hemp0x Core Team"]
 license = "MIT"
@@ -38,6 +38,8 @@ rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
 sevenz-rust = "0.6"
 ureq = { version = "2", features = ["json"] }
+reqwest = { version = "0.11", features = ["blocking", "stream"] }
+zip = "0.6"
 base64 = "0.22"
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt-multi-thread", "macros"] }
 sha2 = "0.10"
@@ -51,3 +53,5 @@ hmac = "0.12"
 scrypt = "0.11"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 bip39 = { version = "2", features = ["rand"] }
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+ripemd = "0.1"

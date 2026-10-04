@@ -19,6 +19,10 @@ use modules::short_message_table_packs;
 use modules::stratum;
 use modules::vault;
 use modules::wallet_pin_unlock;
+use modules::rvn_rpc;
+use modules::rvn_process;
+use modules::rvn_commands;
+use modules::atomic_swap;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -409,7 +413,45 @@ pub fn run() {
             wallet_pin_unlock::wallet_pin_unlock,
             // Active runtime wallet passphrase unlock (slice 76c routing cleanup)
             wallet_pin_unlock::wallet_unlock_active,
+            // Ravencoin Multi-Chain Support
+            rvn_rpc::rvn_rpc_dashboard,
+            rvn_rpc::rvn_rpc_get_blockchain_info,
+            rvn_rpc::rvn_rpc_get_wallet_info,
+            rvn_rpc::rvn_rpc_call,
+            rvn_rpc::rvn_get_config_status,
+            rvn_rpc::rvn_ensure_config,
+            rvn_process::rvn_start_node,
+            rvn_process::rvn_stop_node,
+            rvn_process::rvn_stop_node_and_wait,
+            rvn_process::rvn_get_runtime_status,
+            rvn_process::rvn_get_binary_status,
+            rvn_process::rvn_wait_for_daemon_ready,
+            rvn_commands::rvn_new_address,
+            modules::snapshot::rvn_download_snapshot,
+            rvn_commands::rvn_get_receive_addresses,
+            rvn_commands::rvn_delete_receive_address,
+            rvn_commands::rvn_send_rvn,
+            rvn_commands::rvn_preview_send,
+            rvn_commands::rvn_list_assets,
+            rvn_commands::rvn_get_asset_data,
+            rvn_commands::rvn_transfer_asset,
+            rvn_commands::rvn_list_network_assets,
+            rvn_commands::rvn_get_transaction_history,
+            rvn_commands::rvn_list_utxos,
+            rvn_commands::rvn_wallet_unlock,
+            rvn_commands::rvn_wallet_lock,
+            rvn_commands::rvn_wallet_encrypt,
+            atomic_swap::swap_generate_intent,
+            atomic_swap::swap_lock_initiator,
+            atomic_swap::swap_create_offer,
+            atomic_swap::swap_accept_offer,
+            atomic_swap::swap_status,
+            atomic_swap::swap_list,
+            atomic_swap::swap_claim,
+            atomic_swap::swap_refund,
+            atomic_swap::swap_delete,
         ])
+
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

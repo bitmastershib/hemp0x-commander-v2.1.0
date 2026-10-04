@@ -18,3 +18,11 @@ pub mod stratum;
 pub mod utils;
 pub mod vault;
 pub mod wallet_pin_unlock;
+
+// ─── Ravencoin Multi-Chain Support ───────────────────────────────────────────
+pub mod rvn_models;
+pub mod rvn_rpc;
+pub mod rvn_process;
+pub mod rvn_commands;
+pub mod atomic_swap;
+pub mod snapshot;

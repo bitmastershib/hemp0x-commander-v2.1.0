@@ -434,6 +434,7 @@ pub fn unlock_active_wallet(password: &str, duration: u64) -> Result<(), String>
             rpc::call_rpc("walletpassphrase", &params)?;
         }
     }
+
     Ok(())
 }
 
