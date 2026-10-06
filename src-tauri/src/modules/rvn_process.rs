@@ -19,7 +19,7 @@ use crate::modules::utils::bin_name;
 
 // ─── Process Detection ───────────────────────────────────────────────────────
 
-fn rvn_daemon_process_running() -> bool {
+pub(crate) fn rvn_daemon_process_running() -> bool {
     #[cfg(unix)]
     {
         return Command::new("ps")

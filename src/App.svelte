@@ -45,6 +45,9 @@
   import { vaultStatus } from "./stores.js";
   import { APP_VERSION } from "./lib/constants.js";
   import { initNostr } from "./lib/stores/nostrStore.js";
+  import FastSyncModal from "./lib/ui/FastSyncModal.svelte";
+
+  let showHempFastSyncModal = false;
 
   let coreBusyUntilMs = 0;
   const unsubscribeCoreBusy = coreBusyUntil.subscribe((value) => {
@@ -1585,6 +1588,13 @@
                 on:click={handleStop}
                 disabled={daemonOperation !== "idle"}
               >STOP</button>
+              {#if !nodeInfo.synced}
+                <button
+                  class="btn-xs"
+                  style="border-color: #00e676; color: #00e676; background: rgba(0, 230, 118, 0.15); font-weight: bold;"
+                  on:click={() => (showHempFastSyncModal = true)}
+                >⚡ FAST SYNC</button>
+              {/if}
               {#if daemonOperation !== "idle"}
                 <span
                   class="daemon-loader"
@@ -1598,6 +1608,10 @@
               {/if}
             </div>
           </div>
+
+          {#if showHempFastSyncModal}
+            <FastSyncModal chain="hemp0x" on:close={() => (showHempFastSyncModal = false)} on:complete={refreshDashboard} />
+          {/if}
 
           <!-- WALLET PANEL -->
           <div class="glass-panel wallet-card cyber-panel">

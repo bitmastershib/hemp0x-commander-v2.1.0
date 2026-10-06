@@ -6,6 +6,7 @@
     import RvnSend from './RvnSend.svelte';
     import RvnReceive from './RvnReceive.svelte';
     import ViewAtomicSwap from './ViewAtomicSwap.svelte';
+    import FastSyncModal from '../ui/FastSyncModal.svelte';
     import { listen } from '@tauri-apps/api/event';
     import './ravencoin.css';
 
@@ -14,9 +15,8 @@
     let updateInterval;
     let isLoading = true;
     let setupRequired = false;
-    let snapshotProgress = null;
-    let isDownloadingSnapshot = false;
     let isChecking = false;
+    let showFastSyncModal = false;
 
     let showEncryptModal = false;
     let encryptPassphrase = '';
@@ -212,13 +212,17 @@
                         {/if}
                     </div>
                 </div>
-                {#if $rvnDaemonRuntime.rpc_ready && !$rvnNodeStatus.synced && $rvnNodeStatus.blocks < 10000 && !isDownloadingSnapshot}
-                    <button class="rvn-button" style="font-size: 11px; padding: 4px 8px; background: transparent; border: 1px solid #3498db; color: #3498db;" on:click={startSnapshot}>
+                {#if !$rvnNodeStatus.synced}
+                    <button class="rvn-button" style="font-size: 11px; padding: 4px 10px; background: rgba(255, 107, 0, 0.15); border: 1px solid #ff6b00; color: #ff6b00; font-weight: bold; cursor: pointer;" on:click={() => showFastSyncModal = true}>
                         ⚡ Fast Sync (Snapshot)
                     </button>
                 {/if}
             </div>
         </div>
+
+        {#if showFastSyncModal}
+            <FastSyncModal chain="ravencoin" on:close={() => showFastSyncModal = false} on:complete={checkStatus} />
+        {/if}
 
         {#if $rvnWalletInfo.status === 'UNENCRYPTED'}
             <div style="background: rgba(231, 76, 60, 0.1); border-left: 4px solid #e74c3c; padding: 12px 20px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;">
@@ -231,16 +235,6 @@
         {/if}
 
         {#if activeRvnTab === 'DASHBOARD'}
-            {#if isDownloadingSnapshot && snapshotProgress}
-                <div class="rvn-card" style="margin-bottom: 20px; border-color: #3498db;">
-                    <h3 style="margin-top: 0; color: #3498db;">Downloading Blockchain Snapshot</h3>
-                    <p>{snapshotProgress.status}</p>
-                    <div style="width: 100%; height: 10px; background: #111; border-radius: 5px; overflow: hidden; margin-top: 10px;">
-                        <div style="height: 100%; background: #3498db; width: {snapshotProgress.progress}%; transition: width 0.3s ease;"></div>
-                    </div>
-                </div>
-            {/if}
-
             <div class="rvn-cards">
             <div class="rvn-card">
                 <h2>Wallet Balance</h2>
