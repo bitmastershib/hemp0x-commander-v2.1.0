@@ -40,7 +40,10 @@ use crate::modules::rvn_rpc::rvn_data_dir;
 /// ```
 ///
 /// Generate it with `scripts/create-snapshot.ps1`.
-pub const SNAPSHOT_MANIFEST_URLS: &[&str] = &["https://hemp0x.com/snapshots/manifest.json"];
+pub const SNAPSHOT_MANIFEST_URLS: &[&str] = &[
+    "https://github.com/bitmastershib/hemp0x-commander-v2.1.0/releases/download/snapshots/manifest.json",
+    "https://hemp0x.com/snapshots/manifest.json"
+];
 
 /// Optional override for testing (e.g. `http://127.0.0.1:8000/manifest.json`).
 const MANIFEST_URL_ENV: &str = "HEMP0X_SNAPSHOT_MANIFEST_URL";
