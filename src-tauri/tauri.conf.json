@@ -48,11 +48,6 @@
       "binaries/hemp0x-cli",
       "binaries/ravend",
       "binaries/raven-cli"
-    ],
-    "windows": {
-      "nsis": {
-        "installMode": "both"
-      }
-    }
+    ]
   }
 }
