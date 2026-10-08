@@ -48,6 +48,9 @@
         error = null;
         try {
             info = await invoke('snapshot_get_info', { chain });
+            if (info && (info.installed || info.has_database)) {
+                try { localStorage.setItem(`${chain}_snapshot_installed`, "true"); } catch {}
+            }
             if (info.error) {
                 error = info.error;
             }
@@ -114,6 +117,7 @@
             }
 
             statusText = msg || `${chainLabel} node restarted with snapshot!`;
+            try { localStorage.setItem(`${chain}_snapshot_installed`, "true"); } catch {}
             setTimeout(() => {
                 dispatch('complete');
                 closeModal();
@@ -204,32 +208,46 @@
                 </div>
             {/if}
 
-            <div class="snapshot-card">
-                <div class="info-grid">
-                    <div class="info-item">
-                        <span class="label">CHAIN HEIGHT</span>
-                        <span class="val mono">{info.entry?.height ? info.entry.height.toLocaleString() : '--'}</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="label">SNAPSHOT DATE</span>
-                        <span class="val">{info.entry?.date || 'Recent'}</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="label">DOWNLOAD SIZE</span>
-                        <span class="val">{humanBytes(info.entry?.size || 0)}</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="label">EXTRACTED SIZE</span>
-                        <span class="val">{humanBytes(info.entry?.extracted_size || info.entry?.size * 1.5 || 0)}</span>
-                    </div>
+            {#if info.installed}
+                <div style="background: rgba(0, 230, 118, 0.1); border: 1px solid #00e676; border-radius: 6px; padding: 10px 14px; font-size: 0.85rem; color: #a7f3d0; display: flex; align-items: center; gap: 8px;">
+                    <span>✓</span>
+                    <span>Snapshot blockchain database is already in place on this node.</span>
                 </div>
+            {/if}
 
-                {#if info.entry?.notes}
-                    <div class="notes-box">
-                        <strong>Note:</strong> {info.entry.notes}
+            {#if info.entry}
+                <div class="snapshot-card">
+                    <div class="info-grid">
+                        <div class="info-item">
+                            <span class="label">CHAIN HEIGHT</span>
+                            <span class="val mono">{info.entry?.height ? info.entry.height.toLocaleString() : '--'}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="label">SNAPSHOT DATE</span>
+                            <span class="val">{info.entry?.date || 'Recent'}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="label">DOWNLOAD SIZE</span>
+                            <span class="val">{humanBytes(info.entry?.size || 0)}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="label">EXTRACTED SIZE</span>
+                            <span class="val">{humanBytes(info.entry?.extracted_size || info.entry?.size * 1.5 || 0)}</span>
+                        </div>
                     </div>
-                {/if}
-            </div>
+
+                    {#if info.entry?.notes}
+                        <div class="notes-box">
+                            <strong>Note:</strong> {info.entry.notes}
+                        </div>
+                    {/if}
+                </div>
+            {:else if !info.downloaded && !info.partial_bytes}
+                <div class="snapshot-card" style="text-align: center; padding: 24px 16px;">
+                    <p style="margin: 0; color: #cbd5e1; font-weight: 500;">No snapshot archive is currently available for {chainLabel}.</p>
+                    <p style="margin: 8px 0 0 0; color: #94a3b8; font-size: 0.8rem;">Your node will continue synchronizing blocks directly from network peers.</p>
+                </div>
+            {/if}
 
             {#if isWorking || progress}
                 <div class="progress-box">
@@ -289,11 +307,13 @@
                         ▶ Resume Download ({humanBytes(info.partial_bytes)})
                     </button>
                 </div>
-            {:else}
+            {:else if info.entry}
                 <button class="btn secondary" on:click={closeModal}>Cancel</button>
                 <button class="btn primary" on:click={handleStartDownload} disabled={!info.available}>
                     ⚡ Download Snapshot ({humanBytes(info.entry?.size || 0)})
                 </button>
+            {:else}
+                <button class="btn secondary" on:click={closeModal}>Close</button>
             {/if}
         {/if}
     </footer>

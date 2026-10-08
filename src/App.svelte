@@ -48,6 +48,7 @@
   import FastSyncModal from "./lib/ui/FastSyncModal.svelte";
 
   let showHempFastSyncModal = false;
+  let hempSnapshotInstalled = typeof localStorage !== "undefined" && localStorage.getItem("hemp0x_snapshot_installed") === "true";
 
   let coreBusyUntilMs = 0;
   const unsubscribeCoreBusy = coreBusyUntil.subscribe((value) => {
@@ -591,6 +592,12 @@
       recentTx = data.tx;
       lastError = "";
 
+      const blocks = parseInt(data.node.blocks) || 0;
+      if (!hempSnapshotInstalled && (data.node.synced || blocks > 1000)) {
+        hempSnapshotInstalled = true;
+        localStorage.setItem("hemp0x_snapshot_installed", "true");
+      }
+
       if (
         wasNotRunning &&
         data.node.state === "RUNNING" &&
@@ -1043,6 +1050,15 @@
   onMount(() => {
     tauriReady = true; // Force accurate ready state for UI logic
     systemStore.update((s) => ({ ...s, tauriReady: true }));
+
+    if (!hempSnapshotInstalled) {
+      core.invoke("snapshot_get_info", { chain: "hemp0x" }).then((info) => {
+        if (info && (info.installed || info.has_database)) {
+          hempSnapshotInstalled = true;
+          localStorage.setItem("hemp0x_snapshot_installed", "true");
+        }
+      }).catch(() => {});
+    }
 
     // Initialize Nostr P2P network
     initNostr().catch(e => console.error("Nostr init failed:", e));
@@ -1588,7 +1604,7 @@
                 on:click={handleStop}
                 disabled={daemonOperation !== "idle"}
               >STOP</button>
-              {#if !nodeInfo.synced}
+              {#if !hempSnapshotInstalled && !nodeInfo.synced}
                 <button
                   class="btn-xs"
                   style="border-color: #00e676; color: #00e676; background: rgba(0, 230, 118, 0.15); font-weight: bold;"
@@ -1610,7 +1626,7 @@
           </div>
 
           {#if showHempFastSyncModal}
-            <FastSyncModal chain="hemp0x" on:close={() => (showHempFastSyncModal = false)} on:complete={refreshDashboard} />
+            <FastSyncModal chain="hemp0x" on:close={() => (showHempFastSyncModal = false)} on:complete={() => { hempSnapshotInstalled = true; localStorage.setItem("hemp0x_snapshot_installed", "true"); refreshDashboard(); }} />
           {/if}
 
           <!-- WALLET PANEL -->

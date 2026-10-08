@@ -7,7 +7,6 @@
     import RvnReceive from './RvnReceive.svelte';
     import ViewAtomicSwap from './ViewAtomicSwap.svelte';
     import FastSyncModal from '../ui/FastSyncModal.svelte';
-    import { listen } from '@tauri-apps/api/event';
     import './ravencoin.css';
 
     let activeRvnTab = 'DASHBOARD';
@@ -17,6 +16,7 @@
     let setupRequired = false;
     let isChecking = false;
     let showFastSyncModal = false;
+    let rvnSnapshotInstalled = typeof localStorage !== 'undefined' && localStorage.getItem('ravencoin_snapshot_installed') === 'true';
 
     let showEncryptModal = false;
     let encryptPassphrase = '';
@@ -79,9 +79,19 @@
     }
 
     async function checkStatus() {
-        if (isDownloadingSnapshot || isChecking) return;
+        if (isChecking) return;
         isChecking = true;
         try {
+            if (!rvnSnapshotInstalled) {
+                try {
+                    const snapInfo = await invoke('snapshot_get_info', { chain: 'ravencoin' });
+                    if (snapInfo && (snapInfo.installed || snapInfo.has_database)) {
+                        rvnSnapshotInstalled = true;
+                        localStorage.setItem('ravencoin_snapshot_installed', 'true');
+                    }
+                } catch {}
+            }
+
             // First check if daemon process is running
             const runtime = await invoke('rvn_get_runtime_status');
             rvnDaemonRuntime.set(runtime);
@@ -100,6 +110,12 @@
                 // Fetch dashboard data
                 setupRequired = false;
                 const dashboard = await invoke('rvn_rpc_dashboard');
+
+                const blocks = parseInt(dashboard.node.blocks) || 0;
+                if (!rvnSnapshotInstalled && (dashboard.node.synced || blocks > 1000)) {
+                    rvnSnapshotInstalled = true;
+                    localStorage.setItem('ravencoin_snapshot_installed', 'true');
+                }
                 
                 rvnNodeStatus.set({
                     online: true,
@@ -129,44 +145,9 @@
         }
     }
 
-    async function startSnapshot() {
-        isDownloadingSnapshot = true;
-        snapshotProgress = { status: "Starting download...", progress: 0.0 };
-        
-        try {
-            // Stop node first so we can extract into data dir
-            await invoke('rvn_stop_node');
-            
-            const msg = await invoke('rvn_download_snapshot');
-            snapshotProgress = { status: msg, progress: 100.0 };
-            
-            // Wait 2 seconds, then reboot
-            setTimeout(async () => {
-                isDownloadingSnapshot = false;
-                snapshotProgress = null;
-                await invoke('rvn_start_node');
-                checkStatus();
-            }, 2000);
-        } catch (e) {
-            snapshotProgress = { status: `Error: ${e}`, progress: 0.0 };
-            setTimeout(() => {
-                isDownloadingSnapshot = false;
-                snapshotProgress = null;
-            }, 5000);
-        }
-    }
-
-    onMount(async () => {
-        const unlisten = await listen('snapshot-progress', (event) => {
-            snapshotProgress = event.payload;
-        });
-        
+    onMount(() => {
         checkStatus();
         updateInterval = setInterval(checkStatus, 5000);
-        
-        return () => {
-            unlisten();
-        };
     });
 
     onDestroy(() => {
@@ -212,7 +193,7 @@
                         {/if}
                     </div>
                 </div>
-                {#if !$rvnNodeStatus.synced}
+                {#if !rvnSnapshotInstalled && !$rvnNodeStatus.synced}
                     <button class="rvn-button" style="font-size: 11px; padding: 4px 10px; background: rgba(255, 107, 0, 0.15); border: 1px solid #ff6b00; color: #ff6b00; font-weight: bold; cursor: pointer;" on:click={() => showFastSyncModal = true}>
                         ⚡ Fast Sync (Snapshot)
                     </button>
@@ -221,7 +202,7 @@
         </div>
 
         {#if showFastSyncModal}
-            <FastSyncModal chain="ravencoin" on:close={() => showFastSyncModal = false} on:complete={checkStatus} />
+            <FastSyncModal chain="ravencoin" on:close={() => showFastSyncModal = false} on:complete={() => { rvnSnapshotInstalled = true; localStorage.setItem('ravencoin_snapshot_installed', 'true'); checkStatus(); }} />
         {/if}
 
         {#if $rvnWalletInfo.status === 'UNENCRYPTED'}

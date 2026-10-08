@@ -449,6 +449,8 @@ pub struct SnapshotInfo {
     busy: bool,
     error: Option<String>,
     manifest_url: Option<String>,
+    installed: bool,
+    has_database: bool,
 }
 
 #[tauri::command]
@@ -457,6 +459,13 @@ pub async fn snapshot_get_info(chain: String) -> Result<SnapshotInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let busy = chain.flags().busy.load(Ordering::SeqCst);
         let downloaded_local = find_verified_archive(chain).is_some();
+        let has_installed_marker = chain.data_dir().map(|d| d.join(".snapshot_installed").is_file()).unwrap_or(false);
+        let has_database = chain.data_dir().map(|d| {
+            let b = d.join("blocks");
+            let c = d.join("chainstate");
+            b.is_dir() && c.is_dir() && fs::read_dir(&b).map(|mut r| r.next().is_some()).unwrap_or(false)
+        }).unwrap_or(false);
+        let installed = has_installed_marker || has_database;
 
         match fetch_entry(chain) {
             Ok((entry, manifest_url)) => {
@@ -483,6 +492,8 @@ pub async fn snapshot_get_info(chain: String) -> Result<SnapshotInfo, String> {
                     busy,
                     error: None,
                     manifest_url: Some(manifest_url),
+                    installed,
+                    has_database,
                 })
             }
             Err(error) => Ok(SnapshotInfo {
@@ -495,6 +506,8 @@ pub async fn snapshot_get_info(chain: String) -> Result<SnapshotInfo, String> {
                 busy,
                 error: Some(error),
                 manifest_url: None,
+                installed,
+                has_database,
             }),
         }
     })
@@ -869,6 +882,7 @@ fn install_blocking(app: &AppHandle, chain: Chain) -> Result<String, String> {
     let _ = fs::remove_dir_all(&temp);
     let _ = fs::remove_dir_all(data_dir.join(BACKUP_DIR));
     let _ = fs::remove_dir_all(data_dir.join(DOWNLOAD_DIR));
+    let _ = fs::write(data_dir.join(".snapshot_installed"), chrono::Utc::now().to_rfc3339());
 
     reporter.message("Snapshot installed. Starting node...", 100.0);
     Ok(format!(
