@@ -509,7 +509,8 @@ fn start_node_inner(wallet_name: Option<&str>) -> Result<(), String> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         cmd.arg(format!("-conf={}", cfg.to_string_lossy()))
-            .arg(format!("-datadir={}", dir.to_string_lossy()));
+            .arg(format!("-datadir={}", dir.to_string_lossy()))
+            .arg("-rpcport=42068");
         if let Some(ref flag) = repair_flag {
             cmd.arg(format!("-{}", flag));
         }
@@ -522,6 +523,7 @@ fn start_node_inner(wallet_name: Option<&str>) -> Result<(), String> {
     {
         cmd.arg(format!("-conf={}", cfg.to_string_lossy()))
             .arg(format!("-datadir={}", dir.to_string_lossy()))
+            .arg("-rpcport=42068")
             .arg("-daemon");
         if let Some(ref flag) = repair_flag {
             cmd.arg(format!("-{}", flag));

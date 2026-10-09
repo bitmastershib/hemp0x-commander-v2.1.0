@@ -173,7 +173,8 @@ fn rvn_start_node_blocking() -> Result<String, String> {
     }
 
     cmd.arg(format!("-conf={}", config_path.to_string_lossy()))
-        .arg(format!("-datadir={}", data_dir.to_string_lossy()));
+        .arg(format!("-datadir={}", data_dir.to_string_lossy()))
+        .arg("-rpcport=8766");
 
     #[cfg(unix)]
     {

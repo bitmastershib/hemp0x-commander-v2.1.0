@@ -265,12 +265,22 @@ pub fn ensure_config() -> Result<PathBuf, String> {
             "# Hemp0x Configuration\n\
        # Core cookie auth is used by default; rpcuser/rpcpassword are not required.\n\
        server=1\n\
+       rpcport=42068\n\
        daemon={}\n\
        addnode=154.38.164.123:42069\n\
        addnode=147.93.185.184:42069\n",
             daemon_flag
         );
         fs::write(&cfg, content).map_err(|e| e.to_string())?;
+    } else {
+        // Ensure existing hemp.conf sets rpcport=42068 so it never defaults to 8766
+        // and collides with the Ravencoin daemon.
+        if let Ok(mut content) = fs::read_to_string(&cfg) {
+            if !content.lines().any(|l| l.trim().starts_with("rpcport=")) {
+                content.push_str("\nrpcport=42068\n");
+                let _ = fs::write(&cfg, content);
+            }
+        }
     }
     Ok(cfg)
 }

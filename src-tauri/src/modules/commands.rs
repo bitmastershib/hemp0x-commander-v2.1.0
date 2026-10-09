@@ -93,9 +93,14 @@ pub fn run_cli(args: &[String]) -> Result<String, String> {
         cmd.arg("-testnet");
     }
 
-    let output = cmd
+    let port = config.get("rpcport").map(|v| v.as_str()).unwrap_or("42068");
+    let mut cmd_builder = cmd
         .arg(format!("-conf={}", cfg.to_string_lossy()))
-        .arg(format!("-datadir={}", dir.to_string_lossy()))
+        .arg(format!("-datadir={}", dir.to_string_lossy()));
+    if !is_regtest && !is_testnet {
+        cmd_builder = cmd_builder.arg(format!("-rpcport={port}"));
+    }
+    let output = cmd_builder
         .args(args.iter().map(|v| v.as_str()))
         .output()
         .map_err(|e| e.to_string())?;
