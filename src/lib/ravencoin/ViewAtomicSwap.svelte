@@ -2,7 +2,7 @@
     import { onMount } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
     import { activeSwaps, swapWizardState } from '../stores/swapStores.js';
-    import { nostrState, publishOffer, publishHandshakeAccept, syncLocalIntentOffers, removeLocalOffer } from '../stores/nostrStore.js';
+    import { nostrState, publishOffer, publishHandshakeAccept, syncLocalIntentOffers, removeLocalOffer, publishOfferCancelled } from '../stores/nostrStore.js';
     import { addToastNotification } from '../stores/notifications.js';
 
     let loadError = null;
@@ -127,12 +127,20 @@
     async function loadAddresses() {
         try {
             const hempRes = await invoke('get_receive_addresses', { showChange: false });
-            myHempAddresses = hempRes.map(a => a.address);
+            myHempAddresses = Array.isArray(hempRes) ? hempRes.map(a => a.address) : [];
+            if (myHempAddresses.length === 0) {
+                const newHemp = await invoke('get_new_address');
+                if (newHemp) myHempAddresses = [newHemp];
+            }
         } catch(e) { console.warn("Failed to load hemp addresses", e); }
         
         try {
             const rvnRes = await invoke('rvn_get_receive_addresses');
-            myRvnAddresses = rvnRes.map(a => a.address);
+            myRvnAddresses = Array.isArray(rvnRes) ? rvnRes.map(a => a.address) : [];
+            if (myRvnAddresses.length === 0) {
+                const newRvn = await invoke('rvn_new_address');
+                if (newRvn) myRvnAddresses = [newRvn];
+            }
         } catch(e) { console.warn("Failed to load rvn addresses", e); }
     }
 
@@ -271,6 +279,7 @@
             }
             if (action === 'swap_delete') {
                 removeLocalOffer(swapId);
+                await publishOfferCancelled(swapId);
             }
             loadSwaps();
         } catch (e) {
@@ -280,6 +289,16 @@
             }
             loadError = e.toString();
         }
+    }
+
+    async function cancelMyOffer(publicOffer) {
+        const swapId = publicOffer?.rawData?.swap_id;
+        if (!swapId) return;
+        try {
+            await invoke('swap_delete', { swapId });
+        } catch (_) {}
+        await publishOfferCancelled(swapId);
+        loadSwaps();
     }
 
     async function handleClaim(swapId) {
@@ -313,7 +332,10 @@
         }
     }
 
-    function openCreate() {
+    async function openCreate() {
+        if (myHempAddresses.length === 0 || myRvnAddresses.length === 0) {
+            await loadAddresses();
+        }
         swapWizardState.set({
             isOpen: true,
             step: 1,
@@ -335,9 +357,12 @@
         });
     }
 
-    function openAccept(publicOffer = null) {
+    async function openAccept(publicOffer = null) {
         if (publicOffer && publicOffer instanceof Event) {
             publicOffer = null;
+        }
+        if (myHempAddresses.length === 0 || myRvnAddresses.length === 0) {
+            await loadAddresses();
         }
         // Initiator offers on publicOffer.offer_chain (so Acceptor receives on offer_chain -> wantAddress)
         // Initiator wants on publicOffer.want_chain (so Acceptor sends/locks on want_chain -> offerAddress)
@@ -633,7 +658,10 @@
                             <td style="font-size: 13px; color: #aaa;">{new Date(publicOffer.created_at * 1000).toLocaleString()}</td>
                             <td>
                                 {#if publicOffer.pubkey === $nostrState.pubkey}
-                                    <span style="font-size: 12px; color: #888; border: 1px solid #444; padding: 4px 8px; border-radius: 4px; background: #222;">Your Offer</span>
+                                    <div style="display: flex; gap: 6px; align-items: center;">
+                                        <span style="font-size: 12px; color: #888; border: 1px solid #444; padding: 4px 8px; border-radius: 4px; background: #222;">Your Offer</span>
+                                        <button class="rvn-button" style="padding: 2px 8px; font-size: 11px; background: transparent; border: 1px solid #e74c3c; color: #e74c3c;" on:click={() => cancelMyOffer(publicOffer)}>Cancel</button>
+                                    </div>
                                 {:else}
                                     <button class="rvn-button" style="padding: 4px 12px; font-size: 13px; background: rgba(52, 152, 219, 0.1); border: 1px solid #3498db; color: #3498db;" on:click={() => openAccept(publicOffer)}>
                                         Accept Trade

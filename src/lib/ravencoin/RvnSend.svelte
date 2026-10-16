@@ -74,7 +74,8 @@
         try {
             const result = await invoke('rvn_preview_send', {
                 address,
-                amount: parseFloat(amount)
+                amount: parseFloat(amount),
+                fromAddress: fromAddress || null
             });
 
             if (result.success) {
@@ -112,6 +113,11 @@
                 status: dashboard.wallet.status,
                 transactions: dashboard.tx
             });
+
+            // Refresh address list with updated balances
+            try {
+                myRvnAddresses = await invoke('rvn_get_receive_addresses');
+            } catch (_) {}
 
         } catch (e) {
             if (isWalletUnlockError(e)) {

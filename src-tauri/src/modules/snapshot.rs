@@ -463,7 +463,9 @@ pub async fn snapshot_get_info(chain: String) -> Result<SnapshotInfo, String> {
         let has_database = chain.data_dir().map(|d| {
             let b = d.join("blocks");
             let c = d.join("chainstate");
-            b.is_dir() && c.is_dir() && fs::read_dir(&b).map(|mut r| r.next().is_some()).unwrap_or(false)
+            let has_substantial_blocks = b.join("blk00001.dat").is_file()
+                || fs::metadata(b.join("blk00000.dat")).map(|m| m.len() > 32 * 1024 * 1024).unwrap_or(false);
+            b.is_dir() && c.is_dir() && has_substantial_blocks
         }).unwrap_or(false);
         let installed = has_installed_marker || has_database;
 

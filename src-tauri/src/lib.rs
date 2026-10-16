@@ -384,6 +384,7 @@ pub fn run() {
             provider_settings::ipfs_vault_preview_export_core_wallet_to_webcom_primary,
             provider_settings::ipfs_vault_backup_current_core_wallet_before_alignment,
             // Vault Commander-managed wallet commands (slice 64i)
+            vault::vault_connect_webcom_primary_wallet_to_core_guided,
             vault::vault_set_active_wallet_name,
             vault::vault_get_active_wallet_name,
             vault::vault_get_active_wallet_startup_state,
@@ -416,6 +417,7 @@ pub fn run() {
             // Ravencoin Multi-Chain Support
             rvn_rpc::rvn_rpc_dashboard,
             rvn_rpc::rvn_rpc_get_blockchain_info,
+            rvn_rpc::rvn_rpc_get_network_info,
             rvn_rpc::rvn_rpc_get_wallet_info,
             rvn_rpc::rvn_rpc_call,
             rvn_rpc::rvn_get_config_status,

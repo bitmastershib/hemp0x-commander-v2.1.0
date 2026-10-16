@@ -201,6 +201,9 @@ fn send_rvn_rpc_request(
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("unknown RPC error");
+        if let Some(code) = err.get("code").and_then(|c| c.as_i64()) {
+            return Err(format!("RVN RPC error ({method}) [error code: {code}]: {msg}"));
+        }
         return Err(format!("RVN RPC error ({method}): {msg}"));
     }
 
@@ -430,7 +433,16 @@ fn rvn_rpc_dashboard_blocking() -> Result<RvnDashboardData, String> {
     let fast_connect = Duration::from_millis(800);
     let fast_read = Duration::from_millis(2500);
 
-    let info = call_rvn_rpc_with_timeouts("getinfo", &[], fast_connect, fast_read)?;
+    let mut info = call_rvn_rpc_with_timeouts("getinfo", &[], fast_connect, fast_read)?;
+    if let Ok(wallet_info) = call_rvn_rpc_with_timeouts("getwalletinfo", &[], fast_connect, fast_read) {
+        if let Some(info_obj) = info.as_object_mut() {
+            for key in ["balance", "unconfirmed_balance", "immature_balance", "unlocked_until"] {
+                if let Some(val) = wallet_info.get(key) {
+                    info_obj.insert(key.to_string(), val.clone());
+                }
+            }
+        }
+    }
     let bc = call_rvn_rpc_with_timeouts("getblockchaininfo", &[], fast_connect, fast_read)?;
     let tx_params = [
         serde_json::Value::String("*".to_string()),

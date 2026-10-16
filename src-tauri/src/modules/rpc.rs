@@ -730,6 +730,9 @@ fn rpc_dashboard_blocking() -> Result<DashboardData, String> {
             fast_read,
         )?
     } else {
+        if let Ok(wallet_info) = ctx.call_with_timeouts("getwalletinfo", &[], fast_connect, fast_read) {
+            overlay_wallet_info(&mut info, &wallet_info);
+        }
         ctx.call_with_timeouts("listtransactions", &tx_params, fast_connect, fast_read)?
     };
 

@@ -344,11 +344,13 @@ fn read_varint(data: &[u8]) -> Result<(u64, usize), String> {
         },
         254 => {
             if data.len() < 5 { return Err("EOF".into()); }
-            Ok((u32::from_le_bytes(data[1..5].try_into().unwrap()) as u64, 5))
+            let bytes = data[1..5].try_into().map_err(|_| "Invalid varint length".to_string())?;
+            Ok((u32::from_le_bytes(bytes) as u64, 5))
         },
         255 => {
             if data.len() < 9 { return Err("EOF".into()); }
-            Ok((u64::from_le_bytes(data[1..9].try_into().unwrap()), 9))
+            let bytes = data[1..9].try_into().map_err(|_| "Invalid varint length".to_string())?;
+            Ok((u64::from_le_bytes(bytes), 9))
         }
     }
 }
@@ -476,18 +478,40 @@ fn hemp_sendtoaddress(address: &str, amount: f64) -> Result<String, String> {
 }
 
 fn rvn_find_utxo(txid: &str, address: &str) -> Result<(u32, f64, String), String> {
-    let res = rvn_rpc::call_rvn_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(true)])?;
-    let vouts = res.get("vout").and_then(|v| v.as_array()).ok_or("No vout in tx")?;
-    for vout in vouts {
-        let n = vout.get("n").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let value = vout.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let spk_obj = vout.get("scriptPubKey").ok_or("No scriptPubKey")?;
-        let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
-        let addrs = spk_obj.get("addresses").and_then(|a| a.as_array());
-        if let Some(addrs) = addrs {
-            for a in addrs {
-                if a.as_str() == Some(address) {
-                    return Ok((n, value, spk_hex));
+    if let Ok(res) = rvn_rpc::call_rvn_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(true)]) {
+        if let Some(vouts) = res.get("vout").and_then(|v| v.as_array()) {
+            for vout in vouts {
+                let n = vout.get("n").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let value = vout.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                if let Some(spk_obj) = vout.get("scriptPubKey") {
+                    let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
+                    if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
+                        for a in addrs {
+                            if a.as_str() == Some(address) {
+                                return Ok((n, value, spk_hex));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: check gettxout for n in 0..16 in case txindex is disabled
+    for n in 0..16u32 {
+        if let Ok(out) = rvn_rpc::call_rvn_rpc("gettxout", &[serde_json::Value::String(txid.to_string()), serde_json::json!(n), serde_json::json!(true)]) {
+            if out.is_null() {
+                continue;
+            }
+            let value = out.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if let Some(spk_obj) = out.get("scriptPubKey") {
+                let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
+                if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
+                    for a in addrs {
+                        if a.as_str() == Some(address) {
+                            return Ok((n, value, spk_hex));
+                        }
+                    }
                 }
             }
         }
@@ -496,18 +520,40 @@ fn rvn_find_utxo(txid: &str, address: &str) -> Result<(u32, f64, String), String
 }
 
 fn hemp_find_utxo(txid: &str, address: &str) -> Result<(u32, f64, String), String> {
-    let res = rpc::call_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(true)])?;
-    let vouts = res.get("vout").and_then(|v| v.as_array()).ok_or("No vout in tx")?;
-    for vout in vouts {
-        let n = vout.get("n").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let value = vout.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let spk_obj = vout.get("scriptPubKey").ok_or("No scriptPubKey")?;
-        let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
-        let addrs = spk_obj.get("addresses").and_then(|a| a.as_array());
-        if let Some(addrs) = addrs {
-            for a in addrs {
-                if a.as_str() == Some(address) {
-                    return Ok((n, value, spk_hex));
+    if let Ok(res) = rpc::call_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(true)]) {
+        if let Some(vouts) = res.get("vout").and_then(|v| v.as_array()) {
+            for vout in vouts {
+                let n = vout.get("n").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let value = vout.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                if let Some(spk_obj) = vout.get("scriptPubKey") {
+                    let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
+                    if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
+                        for a in addrs {
+                            if a.as_str() == Some(address) {
+                                return Ok((n, value, spk_hex));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: check gettxout for n in 0..16 in case txindex is disabled
+    for n in 0..16u32 {
+        if let Ok(out) = rpc::call_rpc("gettxout", &[serde_json::Value::String(txid.to_string()), serde_json::json!(n), serde_json::json!(true)]) {
+            if out.is_null() {
+                continue;
+            }
+            let value = out.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if let Some(spk_obj) = out.get("scriptPubKey") {
+                let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
+                if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
+                    for a in addrs {
+                        if a.as_str() == Some(address) {
+                            return Ok((n, value, spk_hex));
+                        }
+                    }
                 }
             }
         }
@@ -1039,13 +1085,54 @@ pub async fn swap_finalize_offer(swap_id: String, accept_code: String) -> Result
     .map_err(|e| format!("Swap finalize task failed: {e}"))?
 }
 
+fn is_htlc_tx_confirmed(chain: &str, txid: &str) -> bool {
+    if txid.trim().is_empty() {
+        return false;
+    }
+    if chain.eq_ignore_ascii_case("rvn") || chain.eq_ignore_ascii_case("ravencoin") {
+        if let Ok(res) = rvn_rpc::call_rvn_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(true)]) {
+            if let Some(confs) = res.get("confirmations").and_then(|c| c.as_i64()) {
+                if confs > 0 { return true; }
+            }
+        }
+        if let Ok(res) = rvn_rpc::call_rvn_rpc("gettxout", &[serde_json::Value::String(txid.to_string()), serde_json::json!(0), serde_json::json!(true)]) {
+            if let Some(confs) = res.get("confirmations").and_then(|c| c.as_i64()) {
+                if confs > 0 { return true; }
+            }
+        }
+    } else {
+        if let Ok(res) = rpc::call_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(true)]) {
+            if let Some(confs) = res.get("confirmations").and_then(|c| c.as_i64()) {
+                if confs > 0 { return true; }
+            }
+        }
+        if let Ok(res) = rpc::call_rpc("gettxout", &[serde_json::Value::String(txid.to_string()), serde_json::json!(0), serde_json::json!(true)]) {
+            if let Some(confs) = res.get("confirmations").and_then(|c| c.as_i64()) {
+                if confs > 0 { return true; }
+            }
+        }
+    }
+    false
+}
+
 /// Check the status of a swap.
 #[tauri::command]
 pub async fn swap_status(swap_id: String) -> Result<SwapStatus, String> {
-    let store = swap_store().lock().map_err(|_| "Swap store lock poisoned")?;
-    let record = store
-        .get(&swap_id)
-        .ok_or_else(|| format!("Swap not found: {swap_id}"))?;
+    let (record, offer_txid, accept_txid, offer_chain, want_chain) = {
+        let store = swap_store().lock().map_err(|_| "Swap store lock poisoned")?;
+        let rec = store
+            .get(&swap_id)
+            .ok_or_else(|| format!("Swap not found: {swap_id}"))?
+            .clone();
+        let off_tx = rec.offer.htlc_txid.clone();
+        let acc_tx = rec.acceptance.as_ref().map(|a| a.accept_htlc_txid.clone()).unwrap_or_default();
+        let off_ch = rec.offer.offer_chain.clone();
+        let wt_ch = rec.offer.want_chain.clone();
+        (rec, off_tx, acc_tx, off_ch, wt_ch)
+    };
+
+    let offer_htlc_confirmed = is_htlc_tx_confirmed(&offer_chain, &offer_txid);
+    let accept_htlc_confirmed = is_htlc_tx_confirmed(&want_chain, &accept_txid);
 
     Ok(SwapStatus {
         swap_id: swap_id.clone(),
@@ -1059,13 +1146,13 @@ pub async fn swap_status(swap_id: String) -> Result<SwapStatus, String> {
         want_asset: record.offer.want_asset.clone(),
         want_address: record.offer.want_address.clone(),
         offer_htlc_funded: !record.offer.htlc_txid.is_empty(),
-        offer_htlc_confirmed: false,
+        offer_htlc_confirmed,
         accept_htlc_funded: record
             .acceptance
             .as_ref()
             .map(|a| !a.accept_htlc_txid.is_empty())
             .unwrap_or(false),
-        accept_htlc_confirmed: false,
+        accept_htlc_confirmed,
         secret_revealed: record.phase == "claimed" || record.phase == "completed",
         completed: record.phase == "completed",
         error: None,

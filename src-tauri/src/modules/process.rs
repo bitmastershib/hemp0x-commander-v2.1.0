@@ -504,13 +504,24 @@ fn start_node_inner(wallet_name: Option<&str>) -> Result<(), String> {
     #[cfg(windows)]
     let mut cmd = Command::new(&daemon);
 
+    let (rpc_port, is_regtest, is_testnet) = if let Ok(config) = parse_config(&cfg) {
+        let is_reg = config.get("regtest").map(|v| v == "1").unwrap_or(false);
+        let is_test = config.get("testnet").map(|v| v == "1").unwrap_or(false);
+        let port = config.get("rpcport").cloned().unwrap_or_else(|| "42068".to_string());
+        (port, is_reg, is_test)
+    } else {
+        ("42068".to_string(), false, false)
+    };
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         cmd.arg(format!("-conf={}", cfg.to_string_lossy()))
-            .arg(format!("-datadir={}", dir.to_string_lossy()))
-            .arg("-rpcport=42068");
+            .arg(format!("-datadir={}", dir.to_string_lossy()));
+        if !is_regtest && !is_testnet {
+            cmd.arg(format!("-rpcport={}", rpc_port));
+        }
         if let Some(ref flag) = repair_flag {
             cmd.arg(format!("-{}", flag));
         }
@@ -522,9 +533,11 @@ fn start_node_inner(wallet_name: Option<&str>) -> Result<(), String> {
     #[cfg(unix)]
     {
         cmd.arg(format!("-conf={}", cfg.to_string_lossy()))
-            .arg(format!("-datadir={}", dir.to_string_lossy()))
-            .arg("-rpcport=42068")
-            .arg("-daemon");
+            .arg(format!("-datadir={}", dir.to_string_lossy()));
+        if !is_regtest && !is_testnet {
+            cmd.arg(format!("-rpcport={}", rpc_port));
+        }
+        cmd.arg("-daemon");
         if let Some(ref flag) = repair_flag {
             cmd.arg(format!("-{}", flag));
         }

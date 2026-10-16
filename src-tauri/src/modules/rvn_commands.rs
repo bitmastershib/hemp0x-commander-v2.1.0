@@ -154,31 +154,137 @@ pub async fn rvn_send_rvn(
     from_address: Option<String>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        if address.is_empty() {
+        let dest = address.trim().to_string();
+        if dest.is_empty() {
             return Err("Destination address is required.".to_string());
         }
-        if amount <= 0.0 {
+        if !amount.is_finite() || amount <= 0.0 {
             return Err("Amount must be greater than zero.".to_string());
         }
 
-        let mut params = vec![
-            serde_json::Value::String(address),
-            serde_json::json!(amount),
-            if let Some(c) = comment { serde_json::Value::String(c) } else { serde_json::Value::String("".to_string()) },
-            serde_json::Value::String("".to_string()), // comment_to
-            serde_json::Value::Bool(false), // subtractfeefromamount
-        ];
-        
-        // Ravencoin sendtoaddress might not support sender_address at pos 8,
-        // but it does have fundrawtransaction which is complex.
-        // Actually, sendfrom is deprecated but available. However, sendtoaddress with sender_address 
-        // works in modern Ravencoin. We pad with null/default up to index 8.
-        if let Some(from) = from_address.filter(|s| !s.is_empty()) {
-            params.push(serde_json::Value::Bool(false)); // replaceable
-            params.push(serde_json::Value::Null); // conf_target
-            params.push(serde_json::Value::String("UNSET".to_string())); // estimate_mode
-            params.push(serde_json::Value::String(from)); // sender_address
+        if let Some(from) = from_address.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            // Coin-control send from a specific RVN address using UTXO selection
+            let utxos_val = call_rvn_rpc(
+                "listunspent",
+                &[
+                    serde_json::json!(0),
+                    serde_json::json!(9999999),
+                    serde_json::json!([from.clone()]),
+                ],
+            )?;
+            let utxos = utxos_val
+                .as_array()
+                .ok_or_else(|| "Unexpected response from listunspent".to_string())?;
+
+            let mut selected_inputs = Vec::new();
+            let mut total_in_sats: i64 = 0;
+            let target_sats = (amount * 100_000_000.0).round() as i64;
+
+            for u in utxos {
+                if u.get("spendable").and_then(|v| v.as_bool()) == Some(false) {
+                    continue;
+                }
+                let u_amt = u.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let u_sats = (u_amt * 100_000_000.0).round() as i64;
+                if u_sats <= 0 {
+                    continue;
+                }
+                let txid = u.get("txid").and_then(|v| v.as_str()).unwrap_or("");
+                let vout = u.get("vout").and_then(|v| v.as_u64()).unwrap_or(0);
+                if txid.is_empty() {
+                    continue;
+                }
+                selected_inputs.push(serde_json::json!({
+                    "txid": txid,
+                    "vout": vout,
+                }));
+                total_in_sats += u_sats;
+
+                let est_bytes = (148 * selected_inputs.len() + 34 * 2 + 10) as i64;
+                let fee_sats = ((est_bytes * 1200) / 1000).max(250_000); // ~0.012 RVN/KB, min 0.0025 RVN
+                if total_in_sats >= target_sats + fee_sats {
+                    break;
+                }
+            }
+
+            let est_bytes = (148 * selected_inputs.len().max(1) + 34 * 2 + 10) as i64;
+            let fee_sats = ((est_bytes * 1200) / 1000).max(250_000);
+            if selected_inputs.is_empty() || total_in_sats < target_sats + fee_sats {
+                return Err(format!(
+                    "Insufficient RVN balance in address {} (available: {:.8} RVN, required with fee: {:.8} RVN).",
+                    from,
+                    total_in_sats as f64 / 100_000_000.0,
+                    (target_sats + fee_sats) as f64 / 100_000_000.0
+                ));
+            }
+
+            let change_sats = total_in_sats - target_sats - fee_sats;
+            let mut outputs = serde_json::Map::new();
+            // Avoid duplicate JSON keys when sending back to the same address
+            if dest == from {
+                let net_val = ((total_in_sats - fee_sats) as f64 / 100_000_000.0 * 1e8).round() / 1e8;
+                outputs.insert(dest, serde_json::json!(net_val));
+            } else {
+                let send_val = (target_sats as f64 / 100_000_000.0 * 1e8).round() / 1e8;
+                outputs.insert(dest, serde_json::json!(send_val));
+                // Include change output if above dust threshold (0.0005 RVN = 50,000 sats)
+                if change_sats >= 50_000 {
+                    let change_val = (change_sats as f64 / 100_000_000.0 * 1e8).round() / 1e8;
+                    outputs.insert(from, serde_json::json!(change_val));
+                }
+            }
+
+            let raw_hex_val = call_rvn_rpc(
+                "createrawtransaction",
+                &[
+                    serde_json::Value::Array(selected_inputs),
+                    serde_json::Value::Object(outputs),
+                ],
+            )?;
+            let raw_hex = raw_hex_val
+                .as_str()
+                .ok_or_else(|| "Unexpected response from createrawtransaction".to_string())?;
+
+            let signed_val = call_rvn_rpc(
+                "signrawtransaction",
+                &[serde_json::Value::String(raw_hex.to_string())],
+            )?;
+            let complete = signed_val
+                .get("complete")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !complete {
+                let err_detail = signed_val
+                    .get("errors")
+                    .and_then(|e| e.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|first| first.get("error"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("Wallet may be locked (error code: -13) or missing private key.");
+                return Err(format!("Failed to sign Ravencoin transaction: {err_detail}"));
+            }
+            let signed_hex = signed_val
+                .get("hex")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Missing signed transaction hex".to_string())?;
+
+            let sent_val = call_rvn_rpc(
+                "sendrawtransaction",
+                &[serde_json::Value::String(signed_hex.to_string())],
+            )?;
+            return sent_val
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| "Unexpected response from sendrawtransaction".to_string());
         }
+
+        let params = vec![
+            serde_json::Value::String(dest),
+            serde_json::json!(amount),
+            serde_json::Value::String(comment.unwrap_or_default()),
+            serde_json::Value::String(String::new()),
+            serde_json::Value::Bool(false),
+        ];
 
         let result = call_rvn_rpc("sendtoaddress", &params)?;
         result
@@ -191,7 +297,11 @@ pub async fn rvn_send_rvn(
 }
 
 #[tauri::command]
-pub async fn rvn_preview_send(address: String, amount: f64) -> RpcResult {
+pub async fn rvn_preview_send(
+    address: String,
+    amount: f64,
+    from_address: Option<String>,
+) -> RpcResult {
     tauri::async_runtime::spawn_blocking(move || {
         // Validate address
         let addr_check = call_rvn_rpc(
@@ -212,13 +322,33 @@ pub async fn rvn_preview_send(address: String, amount: f64) -> RpcResult {
             };
         }
 
-        // Get balance
-        let wallet_info = call_rvn_rpc("getwalletinfo", &[]);
-        let balance = wallet_info
-            .as_ref()
+        // Get balance (either for specific from_address or whole wallet)
+        let balance = if let Some(from) = from_address.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            call_rvn_rpc(
+                "listunspent",
+                &[
+                    serde_json::json!(0),
+                    serde_json::json!(9999999),
+                    serde_json::json!([from]),
+                ],
+            )
             .ok()
-            .and_then(|v| v["balance"].as_f64())
-            .unwrap_or(0.0);
+            .and_then(|v| v.as_array().cloned())
+            .map(|arr| {
+                arr.iter()
+                    .filter(|u| u.get("spendable").and_then(|v| v.as_bool()) != Some(false))
+                    .filter_map(|u| u.get("amount").and_then(|v| v.as_f64()))
+                    .sum::<f64>()
+            })
+            .unwrap_or(0.0)
+        } else {
+            let wallet_info = call_rvn_rpc("getwalletinfo", &[]);
+            wallet_info
+                .as_ref()
+                .ok()
+                .and_then(|v| v["balance"].as_f64())
+                .unwrap_or(0.0)
+        };
 
         // Estimate fee
         let fee_result = call_rvn_rpc(
@@ -229,19 +359,18 @@ pub async fn rvn_preview_send(address: String, amount: f64) -> RpcResult {
             .as_ref()
             .ok()
             .and_then(|v| v["feerate"].as_f64())
-            .unwrap_or(0.01);
+            .unwrap_or(0.012);
         // Rough estimate: ~250 bytes for a simple tx
-        let fee_estimate = fee_rate * 250.0 / 1000.0;
+        let fee_estimate = (fee_rate * 250.0 / 1000.0).max(0.0025);
 
         let mut warnings = Vec::new();
         if amount > balance {
             warnings.push("Insufficient balance for this transaction.".to_string());
-        }
-        if amount + fee_estimate > balance {
-            warnings.push("Balance may be insufficient after fees.".to_string());
+        } else if amount + fee_estimate > balance {
+            warnings.push("Balance may be insufficient after network fees.".to_string());
         }
 
-        let validated = amount > 0.0 && amount <= balance && is_valid;
+        let validated = amount > 0.0 && (amount + fee_estimate) <= balance + 1e-8 && is_valid;
 
         let preview = serde_json::json!({
             "destination": address,

@@ -53,6 +53,29 @@ function markEventProcessed(eventId) {
     } catch {}
 }
 
+function getClosedSwaps() {
+    try {
+        return new Set(JSON.parse(localStorage.getItem('hemp0x_closed_swaps') || '[]'));
+    } catch {
+        return new Set();
+    }
+}
+
+function markSwapClosed(swapId) {
+    if (!swapId) return;
+    try {
+        const set = getClosedSwaps();
+        set.add(swapId);
+        const arr = Array.from(set).slice(-500);
+        localStorage.setItem('hemp0x_closed_swaps', JSON.stringify(arr));
+    } catch {}
+}
+
+export function isSwapClosed(swapId) {
+    if (!swapId) return false;
+    return getClosedSwaps().has(swapId);
+}
+
 function savePendingAccept(swapId, wantAddress, offerAddress) {
     try {
         const map = JSON.parse(localStorage.getItem('hemp0x_pending_accepts') || '{}');
@@ -184,6 +207,7 @@ function processGlobalEvent(event) {
             let data = JSON.parse(jsonStr);
 
             if (!data.swap_id || !data.offer_chain || !data.want_chain) return;
+            if (isSwapClosed(data.swap_id)) return;
 
             nostrState.update(s => {
                 if (s.offers.find(o => o.id === event.id || o.rawData?.swap_id === data.swap_id)) return s;
@@ -206,10 +230,13 @@ function processGlobalEvent(event) {
             });
         } catch (e) {}
     } else if (event.kind === 13339 || event.kind === 13340) {
-        // Remove an offer from the marketplace once it is funded
+        // Remove an offer from the marketplace once it is funded or cancelled
         try {
             let data = JSON.parse(atob(event.content));
             if (data.swap_id) {
+                if (data.cancelled) {
+                    markSwapClosed(data.swap_id);
+                }
                 removeLocalOffer(data.swap_id);
             }
         } catch (e) {}
@@ -245,6 +272,11 @@ async function processIncomingEvent(event) {
                 }
             }
         } else if (event.kind === 13339) {
+            if (data.cancelled) {
+                markSwapClosed(data.swap_id);
+                removeLocalOffer(data.swap_id);
+                return;
+            }
             // STEP 3: Acceptor receives Initiator's HTLC Funded
             if (!data.offer_code || !data.swap_id) return;
             const pending = getPendingAccept(data.swap_id);
@@ -441,4 +473,32 @@ export async function publishSecretReveal(counterFundedEventId, acceptorPubkey, 
     let signedEvent = finalizeEvent(event, privKeyBytes);
     await Promise.any(pool.publish(RELAYS, signedEvent));
     return signedEvent.id;
+}
+
+export async function publishOfferCancelled(swapId) {
+    markSwapClosed(swapId);
+    removeLocalOffer(swapId);
+
+    if (!pool || !privKeyBytes) return;
+
+    try {
+        let payload = btoa(JSON.stringify({
+            swap_id: swapId,
+            cancelled: true
+        }));
+
+        let event = {
+            kind: 13339,
+            created_at: Math.floor(Date.now() / 1000),
+            tags: [
+                ["t", "hemp0x_swap_funded"]
+            ],
+            content: payload
+        };
+
+        let signedEvent = finalizeEvent(event, privKeyBytes);
+        await Promise.any(pool.publish(RELAYS, signedEvent));
+    } catch (e) {
+        // relay publish best effort
+    }
 }

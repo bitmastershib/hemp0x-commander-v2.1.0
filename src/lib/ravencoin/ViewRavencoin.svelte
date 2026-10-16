@@ -5,6 +5,7 @@
     import RvnNodeSetup from './RvnNodeSetup.svelte';
     import RvnSend from './RvnSend.svelte';
     import RvnReceive from './RvnReceive.svelte';
+    import RvnAssets from './RvnAssets.svelte';
     import ViewAtomicSwap from './ViewAtomicSwap.svelte';
     import FastSyncModal from '../ui/FastSyncModal.svelte';
     import './ravencoin.css';
@@ -170,6 +171,7 @@
                     <button style="background: none; border: none; font-weight: bold; cursor: pointer; padding: 5px 0; font-size: 14px; {activeRvnTab === 'DASHBOARD' ? 'color: #ff6b00; border-bottom: 2px solid #ff6b00;' : 'color: #888;'}" on:click={() => activeRvnTab = 'DASHBOARD'}>DASHBOARD</button>
                     <button style="background: none; border: none; font-weight: bold; cursor: pointer; padding: 5px 0; font-size: 14px; {activeRvnTab === 'SEND' ? 'color: #ff6b00; border-bottom: 2px solid #ff6b00;' : 'color: #888;'}" on:click={() => activeRvnTab = 'SEND'}>SEND</button>
                     <button style="background: none; border: none; font-weight: bold; cursor: pointer; padding: 5px 0; font-size: 14px; {activeRvnTab === 'RECEIVE' ? 'color: #ff6b00; border-bottom: 2px solid #ff6b00;' : 'color: #888;'}" on:click={() => activeRvnTab = 'RECEIVE'}>RECEIVE</button>
+                    <button style="background: none; border: none; font-weight: bold; cursor: pointer; padding: 5px 0; font-size: 14px; {activeRvnTab === 'ASSETS' ? 'color: #ff6b00; border-bottom: 2px solid #ff6b00;' : 'color: #888;'}" on:click={() => activeRvnTab = 'ASSETS'}>ASSETS</button>
                     <button style="background: none; border: none; font-weight: bold; cursor: pointer; padding: 5px 0; font-size: 14px; {activeRvnTab === 'SWAPS' ? 'color: #3498db; border-bottom: 2px solid #3498db;' : 'color: #888;'}" on:click={() => activeRvnTab = 'SWAPS'}>SWAPS</button>
                 </div>
             </div>
@@ -286,6 +288,8 @@
             <RvnSend />
         {:else if activeRvnTab === 'RECEIVE'}
             <RvnReceive />
+        {:else if activeRvnTab === 'ASSETS'}
+            <RvnAssets />
         {:else if activeRvnTab === 'SWAPS'}
             <ViewAtomicSwap />
         {/if}
