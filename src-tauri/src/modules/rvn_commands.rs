@@ -45,8 +45,6 @@ pub async fn rvn_new_address(label: Option<String>) -> Result<String, String> {
 #[tauri::command]
 pub async fn rvn_get_receive_addresses() -> Result<Vec<serde_json::Value>, String> {
     tauri::async_runtime::spawn_blocking(|| {
-        // listreceivedbyaddress with args [minconf: 0, include_empty: true]
-        let result = call_rvn_rpc("listreceivedbyaddress", &[serde_json::json!(0), serde_json::json!(true)])?;
         let mut addresses = Vec::new();
         let mut seen = std::collections::HashSet::new();
 

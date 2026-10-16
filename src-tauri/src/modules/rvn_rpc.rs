@@ -143,16 +143,14 @@ fn rvn_rpc_auth() -> Result<(String, RpcAuthMode), String> {
 struct RvnRpcContext {
     url: String,
     auth: String,
-    auth_mode: RpcAuthMode,
 }
 
 fn rvn_rpc_context() -> Result<RvnRpcContext, String> {
     let url = rvn_rpc_url()?;
-    let (auth, auth_mode) = rvn_rpc_auth()?;
+    let (auth, _auth_mode) = rvn_rpc_auth()?;
     Ok(RvnRpcContext {
         url,
         auth,
-        auth_mode,
     })
 }
 
@@ -413,6 +411,7 @@ fn build_rvn_dashboard(
                 amount: format!("{:.7}", amount),
                 conf: tx["confirmations"].as_u64().unwrap_or(0),
                 txid: tx["txid"].as_str().unwrap_or("-").to_string(),
+                asset: tx["asset"].as_str().map(|s| s.to_string()),
             }
         })
         .collect();

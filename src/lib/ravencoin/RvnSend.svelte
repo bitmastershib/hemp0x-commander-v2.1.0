@@ -50,7 +50,15 @@
                 pendingAction();
             }
         } catch(e) {
-            unlockError = String(e);
+            const msg = String(e || "");
+            if (msg.toLowerCase().includes("unencrypted")) {
+                showUnlockModal = false;
+                if (pendingAction) {
+                    pendingAction();
+                }
+                return;
+            }
+            unlockError = msg;
         }
     }
 
@@ -88,7 +96,7 @@
             const txid = await invoke('rvn_send_rvn', {
                 address,
                 amount: parseFloat(amount),
-                from_address: fromAddress || null
+                fromAddress: fromAddress || null
             });
             successTxid = txid;
             previewData = null;

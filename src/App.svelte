@@ -26,7 +26,6 @@
 
   // Ravencoin Multi-Chain Components
   import ViewRavencoin from "./lib/ravencoin/ViewRavencoin.svelte";
-  import AtomicSwap from "./lib/crosschain/AtomicSwap.svelte";
   import {
     loadWalletPinStatus,
     defaultUnlockMode,
@@ -335,7 +334,6 @@
     closeCleanupComplete = true;
     showClosePrompt = false;
     closeCleanupInProgress = true;
-    try { await invokeWithCloseWatchdog("rvn_stop_node_and_wait", { timeout_ms: 30000 }, 32000, ""); } catch(e) {}
     try {
       await core.invoke("exit_commander");
     } catch {
@@ -352,12 +350,20 @@
     closeCleanupInProgress = true;
     const closeWaitMs = 30000;
     try {
-      const stop = await invokeWithCloseWatchdog(
-        "stop_node_and_wait",
-        { timeoutMs: 20000 },
-        closeWaitMs,
-        "Commander waited for Core to stop, but Core did not answer in time."
-      );
+      const [stop] = await Promise.all([
+        invokeWithCloseWatchdog(
+          "stop_node_and_wait",
+          { timeoutMs: 20000 },
+          closeWaitMs,
+          "Commander waited for Core to stop, but Core did not answer in time."
+        ),
+        invokeWithCloseWatchdog(
+          "rvn_stop_node_and_wait",
+          { timeoutMs: 20000 },
+          closeWaitMs,
+          ""
+        ).catch(() => ({})),
+      ]);
       if (stop.error) {
         addRuntimeNotification("Daemon stop on close timed out", String(stop.error || "").substring(0, 240), "warning");
       }

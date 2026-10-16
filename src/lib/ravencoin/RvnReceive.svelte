@@ -6,6 +6,7 @@
     let isLoading = true;
     let error = null;
     let generating = false;
+    let copiedAddress = null;
 
     async function loadAddresses() {
         try {
@@ -33,8 +34,16 @@
         }
     }
 
-    function copyAddress(address) {
-        navigator.clipboard.writeText(address);
+    async function copyAddress(address) {
+        try {
+            await navigator.clipboard.writeText(address);
+            copiedAddress = address;
+            setTimeout(() => {
+                if (copiedAddress === address) copiedAddress = null;
+            }, 2000);
+        } catch (e) {
+            error = "Failed to copy address to clipboard.";
+        }
     }
 
     async function deleteAddress(address) {
@@ -85,8 +94,8 @@
                             <td>{addr.label || '-'}</td>
                             <td class="amount receive">{addr.balance} RVN</td>
                             <td style="display: flex; gap: 5px;">
-                                <button class="rvn-button" style="padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid #ff6b00; color: #ff6b00; flex: 1;" on:click={() => copyAddress(addr.address)}>
-                                    Copy
+                                <button class="rvn-button" style="padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid {copiedAddress === addr.address ? '#2ecc71' : '#ff6b00'}; color: {copiedAddress === addr.address ? '#2ecc71' : '#ff6b00'}; flex: 1;" on:click={() => copyAddress(addr.address)}>
+                                    {copiedAddress === addr.address ? 'Copied!' : 'Copy'}
                                 </button>
                                 <button class="rvn-button" style="padding: 4px 8px; background: transparent; border: 1px solid #e74c3c; color: #e74c3c; display: flex; align-items: center; justify-content: center;" title="Hide Address" on:click={() => deleteAddress(addr.address)}>
                                     <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

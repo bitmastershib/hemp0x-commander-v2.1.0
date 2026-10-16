@@ -1,5 +1,5 @@
 <script>
-    import { onMount, onDestroy } from 'svelte';
+    import { onMount } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
     import { activeSwaps, swapWizardState } from '../stores/swapStores.js';
     import { nostrState, publishOffer, publishHandshakeAccept, syncLocalIntentOffers, removeLocalOffer } from '../stores/nostrStore.js';
@@ -22,6 +22,11 @@
             || text.includes("wallet passphrase")
             || text.includes("please enter the wallet passphrase")
             || /wallet.*locked|passphrase|unlock/i.test(text);
+    }
+
+    function detectUnlockChain(err) {
+        const text = String(err || "").toLowerCase();
+        return text.includes("rvn") || text.includes("ravencoin") ? 'rvn' : 'hemp';
     }
 
     function requestWalletUnlock(actionFn, targetChain = 'hemp') {
@@ -56,8 +61,6 @@
         }
     }
 
-
-
     // Marketplace Filters
     let filterOfferChain = 'all';
     let filterWantChain = 'all';
@@ -67,6 +70,59 @@
         if (filterWantChain !== 'all' && o.want_chain !== filterWantChain) return false;
         return true;
     });
+
+    // Parse acceptedCode in Accept mode so address dropdowns filter to the right chains
+    $: parsedAcceptedOffer = (() => {
+        if (!$swapWizardState.acceptedCode) return null;
+        try {
+            return JSON.parse(atob($swapWizardState.acceptedCode.trim()));
+        } catch {
+            return null;
+        }
+    })();
+
+    $: acceptorSendChain = parsedAcceptedOffer?.want_chain || ($swapWizardState.publicOfferEventId ? $swapWizardState.wantChain : null);
+    $: acceptorReceiveChain = parsedAcceptedOffer?.offer_chain || ($swapWizardState.publicOfferEventId ? $swapWizardState.offerChain : null);
+
+    $: if ($swapWizardState.mode === 'accept' && acceptorSendChain) {
+        const validAddrs = acceptorSendChain === 'hemp' ? myHempAddresses : myRvnAddresses;
+        if (validAddrs.length > 0 && !validAddrs.includes($swapWizardState.offerAddress)) {
+            swapWizardState.update(s => ({ ...s, offerAddress: validAddrs[0] }));
+        }
+    }
+
+    $: if ($swapWizardState.mode === 'accept' && acceptorReceiveChain) {
+        const validAddrs = acceptorReceiveChain === 'hemp' ? myHempAddresses : myRvnAddresses;
+        if (validAddrs.length > 0 && !validAddrs.includes($swapWizardState.wantAddress)) {
+            swapWizardState.update(s => ({ ...s, wantAddress: validAddrs[0] }));
+        }
+    }
+
+    function handleOfferChainChange() {
+        const newOfferChain = $swapWizardState.offerChain;
+        const newWantChain = newOfferChain === 'hemp' ? 'rvn' : 'hemp';
+        const newOfferAddr = (newOfferChain === 'hemp' ? myHempAddresses[0] : myRvnAddresses[0]) || '';
+        const newWantAddr = (newWantChain === 'hemp' ? myHempAddresses[0] : myRvnAddresses[0]) || '';
+        swapWizardState.update(s => ({
+            ...s,
+            wantChain: newWantChain,
+            offerAddress: newOfferAddr,
+            wantAddress: newWantAddr
+        }));
+    }
+
+    function handleWantChainChange() {
+        const newWantChain = $swapWizardState.wantChain;
+        const newOfferChain = newWantChain === 'hemp' ? 'rvn' : 'hemp';
+        const newOfferAddr = (newOfferChain === 'hemp' ? myHempAddresses[0] : myRvnAddresses[0]) || '';
+        const newWantAddr = (newWantChain === 'hemp' ? myHempAddresses[0] : myRvnAddresses[0]) || '';
+        swapWizardState.update(s => ({
+            ...s,
+            offerChain: newOfferChain,
+            offerAddress: newOfferAddr,
+            wantAddress: newWantAddr
+        }));
+    }
 
     async function loadAddresses() {
         try {
@@ -84,7 +140,7 @@
         try {
             const swaps = await invoke('swap_list');
             activeSwaps.set(swaps);
-            syncLocalIntentOffers(swaps);
+            await syncLocalIntentOffers(swaps);
         } catch (e) {
             loadError = e.toString();
         }
@@ -95,32 +151,51 @@
         loadAddresses();
         const interval = setInterval(loadSwaps, 10000);
         
-        // Listen for auto-finalized swaps from nostrStore
+        // Listen for auto-finalized swaps and wallet unlock requests from nostrStore
         const handleNostrUpdate = () => loadSwaps();
         const handleAutoClaim = (e) => {
             addToastNotification(`🎉 Success! Your offer was accepted and finalized over the P2P network! Swap ${e.detail.swap_id.substring(0, 8)}...`, "success");
         };
+        const handleUnlockNeeded = (e) => {
+            const chain = e.detail?.chain || 'hemp';
+            const retryFn = e.detail?.retryFn || null;
+            addToastNotification(`Please unlock your ${chain === 'rvn' ? 'Ravencoin' : 'Hemp0x'} wallet to complete the P2P Atomic Swap step.`, "warning");
+            requestWalletUnlock(retryFn, chain);
+        };
         
         window.addEventListener('hemp0x_swap_updated', handleNostrUpdate);
         window.addEventListener('hemp0x_swap_autoclaimed', handleAutoClaim);
+        window.addEventListener('hemp0x_swap_unlock_needed', handleUnlockNeeded);
         
         return () => {
             clearInterval(interval);
             window.removeEventListener('hemp0x_swap_updated', handleNostrUpdate);
             window.removeEventListener('hemp0x_swap_autoclaimed', handleAutoClaim);
+            window.removeEventListener('hemp0x_swap_unlock_needed', handleUnlockNeeded);
         };
     });
 
     async function createOffer() {
         try {
             swapWizardState.update(s => ({ ...s, error: null }));
+            const offerAmt = parseFloat($swapWizardState.offerAmount);
+            const wantAmt = parseFloat($swapWizardState.wantAmount);
+            if (!offerAmt || offerAmt <= 0 || !wantAmt || wantAmt <= 0) {
+                throw new Error("Both offer and receive amounts must be greater than zero.");
+            }
+            if ($swapWizardState.offerChain === $swapWizardState.wantChain) {
+                throw new Error("Offer chain and receive chain must be different.");
+            }
+            if (!$swapWizardState.offerAddress || !$swapWizardState.wantAddress) {
+                throw new Error("Please select valid withdraw and receive addresses (ensure both nodes are running).");
+            }
             const result = await invoke('swap_generate_intent', {
                 offerChain: $swapWizardState.offerChain,
-                offerAmount: parseFloat($swapWizardState.offerAmount),
+                offerAmount: offerAmt,
                 offerAsset: $swapWizardState.offerAsset || null,
                 offerAddress: $swapWizardState.offerAddress,
                 wantChain: $swapWizardState.wantChain,
-                wantAmount: parseFloat($swapWizardState.wantAmount),
+                wantAmount: wantAmt,
                 wantAsset: $swapWizardState.wantAsset || null,
                 wantAddress: $swapWizardState.wantAddress
             });
@@ -129,7 +204,6 @@
             // Publish to Decentralized Order Book!
             try {
                 await publishOffer(result.offer_code);
-                console.log("Published offer to Nostr network!");
             } catch (err) {
                 console.warn("Could not publish to Nostr:", err);
             }
@@ -143,12 +217,18 @@
     async function acceptOffer() {
         try {
             swapWizardState.update(s => ({ ...s, error: null }));
+            if (!$swapWizardState.acceptedCode || !$swapWizardState.acceptedCode.trim()) {
+                throw new Error("Please provide a valid offer code.");
+            }
+            if (!$swapWizardState.offerAddress || !$swapWizardState.wantAddress) {
+                throw new Error("Please select both your refund address and receive address.");
+            }
             
             if ($swapWizardState.publicOfferEventId) {
                 // Phase 3 Automated Handshake!
                 let offerData;
                 try {
-                    offerData = JSON.parse(atob($swapWizardState.acceptedCode));
+                    offerData = JSON.parse(atob($swapWizardState.acceptedCode.trim()));
                 } catch (e) {
                     throw new Error("Invalid offer code");
                 }
@@ -160,12 +240,11 @@
                     $swapWizardState.wantAddress,
                     $swapWizardState.offerAddress
                 );
-                console.log("Published Phase 3 Handshake! Waiting for initiator to lock funds...");
                 swapWizardState.update(s => ({ ...s, step: 2 }));
             } else {
                 // Fallback to Phase 1 Manual Mode if no Nostr connection (pre-funded offers)
                 const result = await invoke('swap_accept_offer', {
-                    offerCode: $swapWizardState.acceptedCode,
+                    offerCode: $swapWizardState.acceptedCode.trim(),
                     wantAddress: $swapWizardState.wantAddress,
                     offerAddress: $swapWizardState.offerAddress
                 });
@@ -175,8 +254,7 @@
             loadSwaps();
         } catch (e) {
             if (isWalletUnlockError(e)) {
-                const target = String(e).includes("RVN") ? 'rvn' : 'hemp';
-                requestWalletUnlock(acceptOffer, target);
+                requestWalletUnlock(acceptOffer, detectUnlockChain(e));
                 return;
             }
             swapWizardState.update(s => ({ ...s, error: e.toString() }));
@@ -197,8 +275,7 @@
             loadSwaps();
         } catch (e) {
             if (isWalletUnlockError(e)) {
-                const target = String(e).includes("RVN") ? 'rvn' : 'hemp';
-                requestWalletUnlock(() => executeSwapAction(action, swapId, extraArg), target);
+                requestWalletUnlock(() => executeSwapAction(action, swapId, extraArg), detectUnlockChain(e));
                 return;
             }
             loadError = e.toString();
@@ -208,22 +285,30 @@
     async function handleClaim(swapId) {
         try {
             const res = await invoke('swap_claim', { swapId, providedSecret: null });
-            alert(res);
+            addToastNotification(res, "success");
             loadSwaps();
         } catch (e) {
+            if (isWalletUnlockError(e)) {
+                requestWalletUnlock(() => handleClaim(swapId), detectUnlockChain(e));
+                return;
+            }
             if (e.toString().includes("provide the secret")) {
                 const secret = prompt("Please enter the secret revealed by the counterparty:");
                 if (secret) {
                     try {
-                        const res2 = await invoke('swap_claim', { swapId, providedSecret: secret });
-                        alert(res2);
+                        const res2 = await invoke('swap_claim', { swapId, providedSecret: secret.trim() });
+                        addToastNotification(res2, "success");
                         loadSwaps();
                     } catch (e2) {
-                        alert(`Error claiming: ${e2}`);
+                        if (isWalletUnlockError(e2)) {
+                            requestWalletUnlock(() => handleClaim(swapId), detectUnlockChain(e2));
+                            return;
+                        }
+                        loadError = `Error claiming: ${e2}`;
                     }
                 }
             } else {
-                alert(`Error claiming: ${e}`);
+                loadError = `Error claiming: ${e}`;
             }
         }
     }
@@ -244,23 +329,35 @@
             generatedCode: null,
             acceptedCode: null,
             activeSwapId: null,
-            error: null
+            error: null,
+            publicOfferEventId: null,
+            publicOfferPubkey: null
         });
     }
 
     function openAccept(publicOffer = null) {
+        if (publicOffer && publicOffer instanceof Event) {
+            publicOffer = null;
+        }
+        // Initiator offers on publicOffer.offer_chain (so Acceptor receives on offer_chain -> wantAddress)
+        // Initiator wants on publicOffer.want_chain (so Acceptor sends/locks on want_chain -> offerAddress)
+        const sendChain = publicOffer ? publicOffer.want_chain : 'rvn';
+        const receiveChain = publicOffer ? publicOffer.offer_chain : 'hemp';
+        const defaultOfferAddr = (sendChain === 'hemp' ? myHempAddresses[0] : myRvnAddresses[0]) || myHempAddresses[0] || myRvnAddresses[0] || '';
+        const defaultWantAddr = (receiveChain === 'hemp' ? myHempAddresses[0] : myRvnAddresses[0]) || myHempAddresses[0] || myRvnAddresses[0] || '';
+
         swapWizardState.set({
             isOpen: true,
             step: 1,
             mode: 'accept',
-            offerChain: publicOffer ? publicOffer.offer_chain : 'hemp',
+            offerChain: receiveChain,
             offerAmount: publicOffer ? publicOffer.offer_amount : 0,
             offerAsset: '',
-            offerAddress: '',
-            wantChain: publicOffer ? publicOffer.want_chain : 'rvn',
+            offerAddress: defaultOfferAddr,
+            wantChain: sendChain,
             wantAmount: publicOffer ? publicOffer.want_amount : 0,
             wantAsset: '',
-            wantAddress: (publicOffer && publicOffer.want_chain === 'hemp') ? myHempAddresses[0] : (publicOffer && publicOffer.want_chain === 'rvn' ? myRvnAddresses[0] : myHempAddresses[0]) || '',
+            wantAddress: defaultWantAddr,
             generatedCode: null,
             acceptedCode: publicOffer ? publicOffer.content : null,
             activeSwapId: null,
@@ -275,7 +372,10 @@
     }
 
     function copyCode() {
-        navigator.clipboard.writeText($swapWizardState.generatedCode);
+        if ($swapWizardState.generatedCode) {
+            navigator.clipboard.writeText($swapWizardState.generatedCode);
+            addToastNotification("Code copied to clipboard!", "info");
+        }
     }
 </script>
 
@@ -284,7 +384,7 @@
         <h1>Atomic Swaps</h1>
         <div>
             <button class="rvn-button" on:click={openCreate}>Create Offer</button>
-            <button class="rvn-button" style="background-color: #3498db;" on:click={openAccept}>Accept Offer</button>
+            <button class="rvn-button" style="background-color: #3498db;" on:click={() => openAccept(null)}>Accept Offer</button>
         </div>
     </div>
 
@@ -310,14 +410,14 @@
                             <h3>You Offer:</h3>
                             <label style="display:block; margin-bottom:10px;">
                                 Chain:
-                                <select bind:value={$swapWizardState.offerChain} style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #333; margin-top:5px;">
+                                <select bind:value={$swapWizardState.offerChain} on:change={handleOfferChainChange} style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #333; margin-top:5px;">
                                     <option value="hemp">Hemp0x</option>
                                     <option value="rvn">Ravencoin</option>
                                 </select>
                             </label>
                             <label style="display:block; margin-bottom:10px;">
                                 Amount:
-                                <input type="number" bind:value={$swapWizardState.offerAmount} style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #333; margin-top:5px;">
+                                <input type="number" step="any" min="0" bind:value={$swapWizardState.offerAmount} style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #333; margin-top:5px;">
                             </label>
 
                             <label style="display:block; margin-bottom:10px;">
@@ -333,14 +433,14 @@
                             <h3>You Receive:</h3>
                             <label style="display:block; margin-bottom:10px;">
                                 Chain:
-                                <select bind:value={$swapWizardState.wantChain} style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #333; margin-top:5px;">
+                                <select bind:value={$swapWizardState.wantChain} on:change={handleWantChainChange} style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #333; margin-top:5px;">
                                     <option value="rvn">Ravencoin</option>
                                     <option value="hemp">Hemp0x</option>
                                 </select>
                             </label>
                             <label style="display:block; margin-bottom:10px;">
                                 Amount:
-                                <input type="number" bind:value={$swapWizardState.wantAmount} style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #333; margin-top:5px;">
+                                <input type="number" step="any" min="0" bind:value={$swapWizardState.wantAmount} style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #333; margin-top:5px;">
                             </label>
 
                             <label style="display:block; margin-bottom:10px;">
@@ -370,47 +470,63 @@
             {:else if $swapWizardState.mode === 'accept'}
                 {#if $swapWizardState.step === 1}
                     <div>
-                        <p>Paste the offer code from the counterparty:</p>
-                        <textarea bind:value={$swapWizardState.acceptedCode} rows="6" style="width:100%; padding:10px; background:#111; color:#eee; border:1px solid #333; font-family:monospace; margin-bottom:15px; resize:none;"></textarea>
+                        {#if parsedAcceptedOffer}
+                            <div style="margin-bottom: 15px; padding: 12px; background: rgba(52, 152, 219, 0.1); border: 1px solid rgba(52, 152, 219, 0.3); border-radius: 6px;">
+                                <strong>Trade Summary:</strong> You send <strong style="color: #ff6b00;">{parsedAcceptedOffer.want_amount} {parsedAcceptedOffer.want_chain?.toUpperCase()}</strong> and receive <strong style="color: #2ecc71;">{parsedAcceptedOffer.offer_amount} {parsedAcceptedOffer.offer_chain?.toUpperCase()}</strong>
+                            </div>
+                        {/if}
+                        {#if !$swapWizardState.publicOfferEventId}
+                            <p>Paste the offer code from the counterparty:</p>
+                            <textarea bind:value={$swapWizardState.acceptedCode} rows="4" style="width:100%; padding:10px; background:#111; color:#eee; border:1px solid #333; font-family:monospace; margin-bottom:15px; resize:none;"></textarea>
+                        {/if}
                         
                         <label style="display:block; margin-bottom:15px;">
-                            Send Funds From Address (Refunds):
+                            Send Funds From Address ({acceptorSendChain ? acceptorSendChain.toUpperCase() : 'Refunds'}):
                             <select bind:value={$swapWizardState.offerAddress} style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #333; margin-top:5px;">
-                                {#each myHempAddresses as addr}
-                                    <option value={addr}>Hemp: {addr}</option>
-                                {/each}
-                                {#each myRvnAddresses as addr}
-                                    <option value={addr}>RVN: {addr}</option>
-                                {/each}
+                                {#if !acceptorSendChain || acceptorSendChain === 'hemp'}
+                                    {#each myHempAddresses as addr}
+                                        <option value={addr}>Hemp: {addr}</option>
+                                    {/each}
+                                {/if}
+                                {#if !acceptorSendChain || acceptorSendChain === 'rvn'}
+                                    {#each myRvnAddresses as addr}
+                                        <option value={addr}>RVN: {addr}</option>
+                                    {/each}
+                                {/if}
                             </select>
-                            <small style="color:#888;">Select the address to send funds from (must match the chain you are offering).</small>
+                            <small style="color:#888;">Select the address to send/refund funds from on the chain you are paying.</small>
                         </label>
 
                         <label style="display:block; margin-bottom:15px;">
-                            Receive Funds To Address:
+                            Receive Funds To Address ({acceptorReceiveChain ? acceptorReceiveChain.toUpperCase() : 'Destination'}):
                             <select bind:value={$swapWizardState.wantAddress} style="width:100%; padding:8px; background:#111; color:#eee; border:1px solid #333; margin-top:5px;">
-                                {#each myHempAddresses as addr}
-                                    <option value={addr}>Hemp: {addr}</option>
-                                {/each}
-                                {#each myRvnAddresses as addr}
-                                    <option value={addr}>RVN: {addr}</option>
-                                {/each}
+                                {#if !acceptorReceiveChain || acceptorReceiveChain === 'hemp'}
+                                    {#each myHempAddresses as addr}
+                                        <option value={addr}>Hemp: {addr}</option>
+                                    {/each}
+                                {/if}
+                                {#if !acceptorReceiveChain || acceptorReceiveChain === 'rvn'}
+                                    {#each myRvnAddresses as addr}
+                                        <option value={addr}>RVN: {addr}</option>
+                                    {/each}
+                                {/if}
                             </select>
-                            <small style="color:#888;">Select the address to receive funds to (must match the chain you are receiving from).</small>
+                            <small style="color:#888;">Select the address to receive funds to on the chain you are receiving.</small>
                         </label>
 
                         <button class="rvn-button" style="width: 100%; background-color: #3498db;" on:click={acceptOffer}>Accept & Lock Funds</button>
                     </div>
                 {:else if $swapWizardState.step === 2}
                     <div style="text-align: center;">
-                        <p style="font-weight: bold;">Success! You have locked your funds.</p>
                         {#if $swapWizardState.publicOfferEventId}
-                            <p style="color: #3498db;">Your acceptance has been broadcasted. The Initiator's app will automatically finalize the trade shortly!</p>
+                            <p style="font-weight: bold; color: #2ecc71;">Handshake Broadcasted!</p>
+                            <p style="color: #3498db;">Your acceptance has been sent over the P2P network. Both wallets will automatically lock and finalize the swap!</p>
                         {:else}
+                            <p style="font-weight: bold;">Success! You have locked your funds.</p>
                             <p>Share this Accept Code back with the initiator to complete the swap.</p>
+                            <textarea readonly rows="6" style="width:100%; padding:10px; background:#111; color:#3498db; border:1px solid #333; font-family:monospace; margin-bottom:15px; resize:none;" value={$swapWizardState.generatedCode}></textarea>
+                            <button class="rvn-button" style="background-color: #3498db;" on:click={copyCode}>Copy Accept Code</button>
                         {/if}
-                        <textarea readonly rows="6" style="width:100%; padding:10px; background:#111; color:#3498db; border:1px solid #333; font-family:monospace; margin-bottom:15px; resize:none;" value={$swapWizardState.generatedCode}></textarea>
-                        <button class="rvn-button" style="background-color: #3498db;" on:click={copyCode}>Copy Accept Code</button>
                     </div>
                 {/if}
             {/if}
@@ -451,8 +567,10 @@
                                         if(code) executeSwapAction('swap_finalize_offer', swap.swap_id, code);
                                     }}>Finalize & Lock</button>
                                     <button class="rvn-button" style="padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid #e74c3c; color: #e74c3c;" on:click={() => executeSwapAction('swap_refund', swap.swap_id)}>Refund</button>
-                                {:else if swap.phase === 'accepted' || swap.phase === 'offered'}
+                                {:else if swap.phase === 'accepted'}
                                     <button class="rvn-button" style="padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid #2ecc71; color: #2ecc71;" on:click={() => handleClaim(swap.swap_id)}>Claim</button>
+                                    <button class="rvn-button" style="padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid #e74c3c; color: #e74c3c;" on:click={() => executeSwapAction('swap_refund', swap.swap_id)}>Refund</button>
+                                {:else if swap.phase === 'offered'}
                                     <button class="rvn-button" style="padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid #e74c3c; color: #e74c3c;" on:click={() => executeSwapAction('swap_refund', swap.swap_id)}>Refund</button>
                                 {:else}
                                     <button class="rvn-button" style="padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid #888; color: #888;" on:click={() => executeSwapAction('swap_delete', swap.swap_id)}>Delete</button>

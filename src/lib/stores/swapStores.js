@@ -19,5 +19,7 @@ export const swapWizardState = writable({
     generatedCode: null,
     acceptedCode: null,
     activeSwapId: null,
-    error: null
+    error: null,
+    publicOfferEventId: null,
+    publicOfferPubkey: null
 });

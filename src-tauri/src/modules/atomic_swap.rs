@@ -35,9 +35,20 @@ use crate::modules::{rpc, rvn_rpc};
 struct SwapRecord {
     offer: SwapOffer,
     acceptance: Option<SwapAcceptance>,
-    secret: Option<String>, // hex-encoded secret (only for initiator)
+    secret: Option<String>, // hex-encoded secret
+    #[serde(default)]
+    is_initiator: Option<bool>,
     phase: String,
     updated_at: u64,
+}
+
+fn record_is_initiator(record: &SwapRecord) -> bool {
+    record.is_initiator.unwrap_or_else(|| {
+        record.offer.status == "intent"
+            || record.offer.status == "created"
+            || record.offer.status == "offered"
+            || !record.offer.offer_code.is_empty()
+    })
 }
 
 fn swap_store() -> &'static Mutex<HashMap<String, SwapRecord>> {
@@ -419,20 +430,6 @@ fn sign_sighash(privkey_wif: &str, sighash: &[u8]) -> Result<(Vec<u8>, Vec<u8>),
 
 // ─── RPC Helpers ─────────────────────────────────────────────────────────────
 
-fn rvn_getnewaddress() -> Result<String, String> {
-    let res = rvn_rpc::call_rvn_rpc("getnewaddress", &[])?;
-    res.as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "Failed to parse RVN getnewaddress".to_string())
-}
-
-fn hemp_getnewaddress() -> Result<String, String> {
-    let res = rpc::call_active_wallet_or_default("getnewaddress", &[])?;
-    res.as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "Failed to parse Hemp getnewaddress".to_string())
-}
-
 fn rvn_decodescript(hex_script: &str) -> Result<String, String> {
     let res = rvn_rpc::call_rvn_rpc("decodescript", &[serde_json::Value::String(hex_script.to_string())])?;
     res.get("p2sh")
@@ -447,6 +444,15 @@ fn hemp_decodescript(hex_script: &str) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| "No P2SH address in Hemp decodescript".to_string())
+}
+
+fn decode_p2sh_for_chain(chain: &str, script: &[u8]) -> String {
+    let hex_script = hex::encode(script);
+    if chain == "hemp" {
+        hemp_decodescript(&hex_script).unwrap_or_default()
+    } else {
+        rvn_decodescript(&hex_script).unwrap_or_default()
+    }
 }
 
 fn rvn_sendtoaddress(address: &str, amount: f64) -> Result<String, String> {
@@ -529,22 +535,6 @@ fn hemp_sendrawtransaction(hex: &str) -> Result<String, String> {
     res.as_str().map(|s| s.to_string()).ok_or_else(|| "Failed to parse Hemp sendrawtransaction".to_string())
 }
 
-fn rvn_signrawtransaction(hex: &str, prevtxs: serde_json::Value) -> Result<String, String> {
-    let res = rvn_rpc::call_rvn_rpc("signrawtransaction", &[serde_json::Value::String(hex.to_string()), prevtxs])?;
-    if !res.get("complete").and_then(|c| c.as_bool()).unwrap_or(false) {
-        return Err("RVN signrawtransaction incomplete".to_string());
-    }
-    res.get("hex").and_then(|h| h.as_str()).map(|s| s.to_string()).ok_or_else(|| "Failed to parse signed hex".to_string())
-}
-
-fn hemp_signrawtransaction(hex: &str, prevtxs: serde_json::Value) -> Result<String, String> {
-    let res = rpc::call_active_wallet_or_default("signrawtransaction", &[serde_json::Value::String(hex.to_string()), prevtxs])?;
-    if !res.get("complete").and_then(|c| c.as_bool()).unwrap_or(false) {
-        return Err("Hemp signrawtransaction incomplete".to_string());
-    }
-    res.get("hex").and_then(|h| h.as_str()).map(|s| s.to_string()).ok_or_else(|| "Failed to parse signed hex".to_string())
-}
-
 // ─── Tauri Commands ──────────────────────────────────────────────────────────
 
 /// Generate an intent to trade (Phase 3). No funds are locked yet.
@@ -562,7 +552,21 @@ pub async fn swap_generate_intent(
     tauri::async_runtime::spawn_blocking(move || {
         let offer_chain_lower = offer_chain.to_lowercase();
         let want_chain_lower = want_chain.to_lowercase();
-        
+        if !["hemp", "rvn"].contains(&offer_chain_lower.as_str()) {
+            return Err("offer_chain must be 'hemp' or 'rvn'".to_string());
+        }
+        if !["hemp", "rvn"].contains(&want_chain_lower.as_str()) {
+            return Err("want_chain must be 'hemp' or 'rvn'".to_string());
+        }
+        if offer_chain_lower == want_chain_lower {
+            return Err("offer_chain and want_chain must be different".to_string());
+        }
+        if offer_amount <= 0.0 || want_amount <= 0.0 {
+            return Err("Amounts must be greater than zero".to_string());
+        }
+        extract_pubkey_hash(&offer_address)?;
+        extract_pubkey_hash(&want_address)?;
+
         let secret = generate_secret();
         let secret_hash = sha256_hash(&secret);
         let secret_hex = hex::encode(&secret);
@@ -600,6 +604,7 @@ pub async fn swap_generate_intent(
             want_amount,
             want_asset,
             want_address,
+            acceptor_want_address: None,
             htlc_address: String::new(),
             htlc_txid: String::new(),
             locktime: 0,
@@ -610,6 +615,7 @@ pub async fn swap_generate_intent(
         let record = SwapRecord {
             offer: offer.clone(),
             secret: Some(secret_hex),
+            is_initiator: Some(true),
             acceptance: None,
             phase: "intent".to_string(),
             updated_at: now_epoch(),
@@ -632,13 +638,16 @@ pub async fn swap_lock_initiator(swap_id: String, acceptor_want_address: String)
         let mut store = swap_store().lock().map_err(|_| "Swap store lock poisoned")?;
         let record = store.get_mut(&swap_id).ok_or_else(|| format!("Swap not found: {swap_id}"))?;
 
+        if record.phase == "offered" && !record.offer.htlc_txid.is_empty() {
+            return Ok(record.offer.offer_code.clone());
+        }
         if record.phase != "intent" {
             return Err("Swap is not in intent phase".to_string());
         }
 
         let locktime = now_epoch() + (48 * 60 * 60);
 
-        // Build HTLC using acceptor's pubkey hash
+        // Build HTLC using acceptor's receive address on offer_chain
         let recipient_pubkey_hash = extract_pubkey_hash(&acceptor_want_address)?;
         let sender_pubkey_hash = extract_pubkey_hash(&record.offer.offer_address)?;
         let secret_hash_bytes = hex::decode(&record.offer.secret_hash)
@@ -657,10 +666,11 @@ pub async fn swap_lock_initiator(swap_id: String, acceptor_want_address: String)
             (p2sh, txid)
         };
 
-        record.offer.want_address = acceptor_want_address;
+        record.offer.acceptor_want_address = Some(acceptor_want_address);
         record.offer.htlc_address = htlc_address;
         record.offer.htlc_txid = htlc_txid;
         record.offer.locktime = locktime;
+        record.offer.status = "offered".to_string();
         record.phase = "offered".to_string();
         record.updated_at = now_epoch();
         
@@ -768,6 +778,7 @@ pub async fn swap_create_offer(
             want_amount,
             want_asset,
             want_address,
+            acceptor_want_address: None,
             htlc_address,
             htlc_txid,
             locktime,
@@ -780,6 +791,7 @@ pub async fn swap_create_offer(
             offer: offer.clone(),
             acceptance: None,
             secret: Some(secret_hex),
+            is_initiator: Some(true),
             phase: "created".to_string(),
             updated_at: now_epoch(),
         };
@@ -813,6 +825,23 @@ pub async fn swap_accept_offer(offer_code: String, want_address: String, offer_a
             .as_str()
             .ok_or("Missing swap_id in offer")?
             .to_string();
+
+        // Hold store lock to prevent duplicate acceptance / double-funding from concurrent relay deliveries
+        let mut store = swap_store().lock().map_err(|_| "Swap store lock poisoned")?;
+        if let Some(existing) = store.get(&swap_id) {
+            if let Some(acc) = &existing.acceptance {
+                let accept_data = serde_json::json!({
+                    "swap_id": swap_id,
+                    "accept_htlc_address": acc.accept_htlc_address,
+                    "accept_htlc_txid": acc.accept_htlc_txid,
+                    "accept_offer_address": acc.acceptor_refund_address.clone().unwrap_or_else(|| acc.want_address.clone()),
+                    "acceptor_want_address": acc.want_address,
+                    "accept_locktime": acc.accept_locktime,
+                });
+                return Ok(base64::prelude::BASE64_STANDARD.encode(accept_data.to_string().as_bytes()));
+            }
+        }
+
         let secret_hash = offer_data["secret_hash"]
             .as_str()
             .ok_or("Missing secret_hash in offer")?
@@ -842,8 +871,13 @@ pub async fn swap_accept_offer(offer_code: String, want_address: String, offer_a
         let initiator_htlc_address = offer_data["htlc_address"].as_str().unwrap_or("").to_string();
         let initiator_htlc_txid = offer_data["htlc_txid"].as_str().unwrap_or("").to_string();
 
-        // Acceptor uses half the initiator's locktime for safety
-        let accept_locktime = now_epoch() + ((offer_locktime - now_epoch()) / 2);
+        let now = now_epoch();
+        if offer_locktime <= now {
+            return Err("Offer has already expired or is not yet locked by the initiator.".to_string());
+        }
+
+        // Acceptor uses half the initiator's remaining locktime for safety
+        let accept_locktime = now + ((offer_locktime - now) / 2);
 
         // Build HTLC script for the chain the acceptor is offering (which is the initiator's want_chain)
         let sender_pubkey_hash = extract_pubkey_hash(&offer_address)?;
@@ -887,6 +921,7 @@ pub async fn swap_accept_offer(offer_code: String, want_address: String, offer_a
             want_amount,
             want_asset,
             want_address: original_want_address,
+            acceptor_want_address: Some(want_address.clone()),
             htlc_address: initiator_htlc_address,
             htlc_txid: initiator_htlc_txid,
             locktime: offer_locktime,
@@ -896,13 +931,13 @@ pub async fn swap_accept_offer(offer_code: String, want_address: String, offer_a
 
         let record = SwapRecord {
             offer,
-            acceptance: Some(acceptance.clone()),
+            acceptance: Some(acceptance),
             secret: None, // Acceptor doesn't know the secret yet
+            is_initiator: Some(false),
             phase: "accepted".to_string(),
             updated_at: now_epoch(),
         };
 
-        let mut store = swap_store().lock().map_err(|_| "Swap store lock poisoned")?;
         store.insert(swap_id.clone(), record);
         persist_swap_store(&store)?;
 
@@ -911,7 +946,9 @@ pub async fn swap_accept_offer(offer_code: String, want_address: String, offer_a
             "swap_id": swap_id,
             "accept_htlc_address": accept_htlc_address,
             "accept_htlc_txid": accept_htlc_txid,
-            "accept_offer_address": offer_address, // The acceptor's refund address (used as sender_pubkey_hash for their HTLC)
+            "accept_offer_address": offer_address,
+            "acceptor_want_address": want_address,
+            "accept_locktime": accept_locktime,
         });
         let accept_code = base64::prelude::BASE64_STANDARD
             .encode(accept_data.to_string().as_bytes());
@@ -961,21 +998,33 @@ pub async fn swap_finalize_offer(swap_id: String, accept_code: String) -> Result
             .get_mut(&swap_id)
             .ok_or_else(|| format!("Swap not found: {swap_id}"))?;
 
-        if record.phase != "created" {
-            return Err("Swap is not in created phase".to_string());
+        if record.phase == "accepted" || record.phase == "claimed" || record.phase == "completed" {
+            return Ok(format!("Swap {} already finalized", swap_id));
+        }
+
+        if record.phase != "created" && record.phase != "offered" {
+            return Err(format!("Swap is not in created or offered phase (current: {})", record.phase));
         }
 
         let offer_locktime = record.offer.locktime;
-        let accept_locktime = now_epoch() + ((offer_locktime - now_epoch()) / 2);
+        let accept_locktime = accept_data["accept_locktime"]
+            .as_u64()
+            .unwrap_or_else(|| now_epoch() + ((offer_locktime.saturating_sub(now_epoch())) / 2));
+
+        let acceptor_want_address = accept_data["acceptor_want_address"]
+            .as_str()
+            .map(|s| s.to_string())
+            .or_else(|| record.offer.acceptor_want_address.clone())
+            .unwrap_or_else(|| accept_offer_address.clone());
 
         let acceptance = SwapAcceptance {
             swap_id: swap_id.clone(),
             accept_htlc_address,
             accept_htlc_txid,
             accept_locktime,
-            want_address: accept_offer_address, // the acceptor's address
+            want_address: acceptor_want_address,
             status: "accepted".to_string(),
-            acceptor_refund_address: None,
+            acceptor_refund_address: Some(accept_offer_address),
         };
 
         record.acceptance = Some(acceptance);
@@ -1010,13 +1059,13 @@ pub async fn swap_status(swap_id: String) -> Result<SwapStatus, String> {
         want_asset: record.offer.want_asset.clone(),
         want_address: record.offer.want_address.clone(),
         offer_htlc_funded: !record.offer.htlc_txid.is_empty(),
-        offer_htlc_confirmed: false, // Would check on-chain
+        offer_htlc_confirmed: false,
         accept_htlc_funded: record
             .acceptance
             .as_ref()
             .map(|a| !a.accept_htlc_txid.is_empty())
             .unwrap_or(false),
-        accept_htlc_confirmed: false, // Would check on-chain
+        accept_htlc_confirmed: false,
         secret_revealed: record.phase == "claimed" || record.phase == "completed",
         completed: record.phase == "completed",
         error: None,
@@ -1062,101 +1111,100 @@ pub async fn swap_claim(swap_id: String, provided_secret: Option<String>) -> Res
             .get_mut(&swap_id)
             .ok_or_else(|| format!("Swap not found: {swap_id}"))?;
 
+        let is_initiator = record_is_initiator(record);
+
+        if record.phase == "claimed" || record.phase == "completed" {
+            let secret_hex = record.secret.clone().unwrap_or_default();
+            return Ok(if is_initiator {
+                format!("Already claimed. Secret: {secret_hex}")
+            } else {
+                "Already claimed.".to_string()
+            });
+        }
+
         if record.phase != "accepted" {
             return Err("Swap must be in accepted phase to claim".to_string());
         }
 
-        let is_initiator = record.secret.is_some();
         let secret_hex = if is_initiator {
-            record.secret.clone().unwrap()
+            record.secret.clone().ok_or("Missing initiator secret")?
+        } else if let Some(s) = provided_secret.filter(|s| !s.is_empty()) {
+            // Persist the revealed secret immediately so it's never lost if the wallet is locked
+            record.secret = Some(s.clone());
+            persist_swap_store(&store)?;
+            s
         } else {
-            provided_secret.ok_or_else(|| "Acceptor must provide the secret to claim".to_string())?
+            record.secret.clone().ok_or_else(|| "Acceptor must provide the secret to claim".to_string())?
         };
 
         let secret_bytes = hex::decode(&secret_hex)
             .map_err(|e| format!("Invalid secret hex: {e}"))?;
 
+        let record = store
+            .get(&swap_id)
+            .ok_or_else(|| format!("Swap not found: {swap_id}"))?;
         let acceptance = record.acceptance.as_ref().ok_or("No acceptance found")?;
 
         let claim_chain;
-        let claim_amount;
         let claim_to_address;
         let htlc_txid;
         let htlc_address;
-        let mut htlc_script;
+        let htlc_script;
 
         if is_initiator {
             // Initiator claims on want_chain (Acceptor's HTLC)
             claim_chain = record.offer.want_chain.clone();
-            claim_amount = record.offer.want_amount;
             claim_to_address = record.offer.want_address.clone();
             htlc_txid = acceptance.accept_htlc_txid.clone();
             htlc_address = acceptance.accept_htlc_address.clone();
             
-            // Reconstruct acceptor's HTLC script
-            let acceptor_refund = acceptance.acceptor_refund_address.clone().unwrap_or(acceptance.want_address.clone());
+            // Reconstruct acceptor's HTLC script:
+            // Acceptor locked funds with sender = acceptor_refund_address, recipient = initiator's want_address
+            let acceptor_refund = acceptance.acceptor_refund_address.clone().unwrap_or_else(|| acceptance.want_address.clone());
             let sender_pubkey_hash = extract_pubkey_hash(&acceptor_refund)?;
             let recipient_pubkey_hash = extract_pubkey_hash(&record.offer.want_address)?;
             let secret_hash_bytes = hex::decode(&record.offer.secret_hash)
                 .map_err(|e| format!("Invalid secret hash: {e}"))?;
                 
-            let htlc_script_normal = build_htlc_script(&secret_hash_bytes, &recipient_pubkey_hash, &sender_pubkey_hash, acceptance.accept_locktime);
+            let script_correct = build_htlc_script(&secret_hash_bytes, &sender_pubkey_hash, &recipient_pubkey_hash, acceptance.accept_locktime);
+            let script_reversed = build_htlc_script(&secret_hash_bytes, &recipient_pubkey_hash, &sender_pubkey_hash, acceptance.accept_locktime);
             let legacy_script = build_legacy_htlc_script(&secret_hash_bytes, &sender_pubkey_hash, acceptance.accept_locktime);
             
-            let p2sh_normal = if claim_chain == "hemp" {
-                crate::modules::atomic_swap::hemp_decodescript(&hex::encode(&htlc_script_normal)).unwrap_or_default()
-            } else {
-                crate::modules::atomic_swap::rvn_decodescript(&hex::encode(&htlc_script_normal)).unwrap_or_default()
-            };
-            
-            let p2sh_legacy = if claim_chain == "hemp" {
-                crate::modules::atomic_swap::hemp_decodescript(&hex::encode(&legacy_script)).unwrap_or_default()
-            } else {
-                crate::modules::atomic_swap::rvn_decodescript(&hex::encode(&legacy_script)).unwrap_or_default()
-            };
-            
-            if htlc_address == p2sh_normal {
-                htlc_script = htlc_script_normal;
-            } else if htlc_address == p2sh_legacy {
+            if htlc_address == decode_p2sh_for_chain(&claim_chain, &script_correct) {
+                htlc_script = script_correct;
+            } else if htlc_address == decode_p2sh_for_chain(&claim_chain, &script_reversed) {
+                htlc_script = script_reversed;
+            } else if htlc_address == decode_p2sh_for_chain(&claim_chain, &legacy_script) {
                 htlc_script = legacy_script;
             } else {
-                htlc_script = htlc_script_normal;
+                htlc_script = script_correct;
             }
         } else {
             // Acceptor claims on offer_chain (Initiator's HTLC)
             claim_chain = record.offer.offer_chain.clone();
-            claim_amount = record.offer.offer_amount;
             claim_to_address = acceptance.want_address.clone();
             htlc_txid = record.offer.htlc_txid.clone();
             htlc_address = record.offer.htlc_address.clone();
 
-            // Reconstruct initiator's HTLC script
+            // Reconstruct initiator's HTLC script:
+            // Initiator locked funds with sender = initiator's offer_address, recipient = acceptor's want_address
             let sender_pubkey_hash = extract_pubkey_hash(&record.offer.offer_address)?;
             let recipient_pubkey_hash = extract_pubkey_hash(&acceptance.want_address)?;
             let secret_hash_bytes = hex::decode(&record.offer.secret_hash)
                 .map_err(|e| format!("Invalid secret hash: {e}"))?;
                 
-            let htlc_script_normal = build_htlc_script(&secret_hash_bytes, &recipient_pubkey_hash, &sender_pubkey_hash, record.offer.locktime);
+            let script_correct = build_htlc_script(&secret_hash_bytes, &sender_pubkey_hash, &recipient_pubkey_hash, record.offer.locktime);
+            let script_reversed = build_htlc_script(&secret_hash_bytes, &recipient_pubkey_hash, &sender_pubkey_hash, record.offer.locktime);
             let legacy_script = build_legacy_htlc_script(&secret_hash_bytes, &sender_pubkey_hash, record.offer.locktime);
             
-            let p2sh_normal = if claim_chain == "hemp" {
-                crate::modules::atomic_swap::hemp_decodescript(&hex::encode(&htlc_script_normal)).unwrap_or_default()
-            } else {
-                crate::modules::atomic_swap::rvn_decodescript(&hex::encode(&htlc_script_normal)).unwrap_or_default()
-            };
-            
-            let p2sh_legacy = if claim_chain == "hemp" {
-                crate::modules::atomic_swap::hemp_decodescript(&hex::encode(&legacy_script)).unwrap_or_default()
-            } else {
-                crate::modules::atomic_swap::rvn_decodescript(&hex::encode(&legacy_script)).unwrap_or_default()
-            };
-            
-            if htlc_address == p2sh_normal {
-                htlc_script = htlc_script_normal;
-            } else if htlc_address == p2sh_legacy {
+            if htlc_address == decode_p2sh_for_chain(&claim_chain, &script_correct) {
+                htlc_script = script_correct;
+            } else if htlc_address == decode_p2sh_for_chain(&claim_chain, &script_reversed) {
+                htlc_script = script_reversed;
+            } else if htlc_address == decode_p2sh_for_chain(&claim_chain, &legacy_script) {
                 htlc_script = legacy_script;
             } else {
-                htlc_script = htlc_script_normal;
+                htlc_script = script_correct;
             }
         }
 
@@ -1168,7 +1216,6 @@ pub async fn swap_claim(swap_id: String, provided_secret: Option<String>) -> Res
         };
 
         // 2. Build the transaction output
-        // We need to pay a small fee. Let's assume 0.01 fee for both chains to avoid min relay fee errors.
         let fee = 0.01;
         if amount <= fee {
             return Err("Amount too small to cover fee".to_string());
@@ -1185,24 +1232,13 @@ pub async fn swap_claim(swap_id: String, provided_secret: Option<String>) -> Res
             rvn_createrawtransaction(inputs, outputs)?
         };
 
-        let mut htlc_address = record.offer.htlc_address.clone();
-        if htlc_address.is_empty() {
-            htlc_address = if claim_chain == "hemp" { record.offer.offer_address.clone() } else { record.offer.want_address.clone() };
-        }
-        let decoded = bs58::decode(&htlc_address).into_vec().map_err(|e| format!("Invalid P2SH: {e}"))?;
-        let p2sh_hash = &decoded[1..21];
-        let mut spk = vec![0xa9, 0x14]; // OP_HASH160, push 20 bytes
-        spk.extend_from_slice(p2sh_hash);
-        spk.push(0x87); // OP_EQUAL
-        let spk_hex = hex::encode(&spk);
-
         // 4. Sign and Inject scriptSig
         let privkey_res = if claim_chain == "hemp" {
-            crate::modules::rpc::call_rpc("dumpprivkey", &[serde_json::Value::String(claim_to_address.clone())])
+            crate::modules::rpc::call_active_wallet_or_default("dumpprivkey", &[serde_json::Value::String(claim_to_address.clone())])
         } else {
             crate::modules::rvn_rpc::call_rvn_rpc("dumpprivkey", &[serde_json::Value::String(claim_to_address.clone())])
         };
-        let privkey_value = privkey_res.map_err(|e| format!("Wallet must be unlocked to sign: {e}"))?;
+        let privkey_value = privkey_res.map_err(|e| format!("Wallet must be unlocked to sign ({claim_chain}): {e}"))?;
         let privkey = privkey_value.as_str().ok_or("Invalid WIF returned")?.to_string();
 
         let raw_tx_bytes = hex::decode(&raw_tx).map_err(|e| format!("Invalid hex tx: {e}"))?;
@@ -1219,14 +1255,10 @@ pub async fn swap_claim(swap_id: String, provided_secret: Option<String>) -> Res
             rvn_sendrawtransaction(&signed_tx)?
         };
 
-        record.phase = "claimed".to_string();
-        record.updated_at = now_epoch();
-        
-        // If acceptor provided secret, save it
-        if !is_initiator {
-            record.secret = Some(secret_hex.clone());
+        if let Some(rec) = store.get_mut(&swap_id) {
+            rec.phase = "claimed".to_string();
+            rec.updated_at = now_epoch();
         }
-
         persist_swap_store(&store)?;
 
         if is_initiator {
@@ -1248,71 +1280,54 @@ pub async fn swap_refund(swap_id: String) -> Result<String, String> {
             .get_mut(&swap_id)
             .ok_or_else(|| format!("Swap not found: {swap_id}"))?;
 
-        let is_initiator = record.secret.is_some();
+        let is_initiator = record_is_initiator(record);
         let offer = &record.offer;
         let acceptance = &record.acceptance;
 
         let refund_chain;
-        let refund_amount;
         let refund_to_address;
         let htlc_txid;
         let htlc_address;
-        let mut htlc_script;
+        let htlc_script;
         let locktime;
-        
-        let mut refund_signing_address = "".to_string();
-        let mut refund_signing_chain = "".to_string();
 
         if is_initiator {
             // Initiator refunds their own HTLC on offer_chain
             refund_chain = offer.offer_chain.clone();
-            refund_amount = offer.offer_amount;
             refund_to_address = offer.offer_address.clone();
             htlc_txid = offer.htlc_txid.clone();
             htlc_address = offer.htlc_address.clone();
             locktime = offer.locktime;
 
             let sender_pubkey_hash = extract_pubkey_hash(&offer.offer_address)?;
-            let recipient_pubkey_hash = if let Some(acc) = &acceptance {
-                extract_pubkey_hash(&acc.want_address)?
-            } else {
-                extract_pubkey_hash(&offer.want_address)?
-            };
+            let recipient_addr = offer
+                .acceptor_want_address
+                .as_deref()
+                .or_else(|| acceptance.as_ref().map(|acc| acc.want_address.as_str()))
+                .unwrap_or(&offer.want_address);
+            let recipient_pubkey_hash = extract_pubkey_hash(recipient_addr)?;
             let secret_hash_bytes = hex::decode(&offer.secret_hash)
                 .map_err(|e| format!("Invalid secret hash: {e}"))?;
                 
-            let htlc_script_funded_by_offeror = build_htlc_script(&secret_hash_bytes, &sender_pubkey_hash, &sender_pubkey_hash, locktime);
+            let script_correct = build_htlc_script(&secret_hash_bytes, &sender_pubkey_hash, &recipient_pubkey_hash, locktime);
+            let script_self = build_htlc_script(&secret_hash_bytes, &sender_pubkey_hash, &sender_pubkey_hash, locktime);
             let legacy_script = build_legacy_htlc_script(&secret_hash_bytes, &sender_pubkey_hash, locktime);
             
-            let p2sh_normal = crate::modules::atomic_swap::hemp_decodescript(&hex::encode(&htlc_script_funded_by_offeror)).unwrap_or_default();
-            let p2sh_legacy = crate::modules::atomic_swap::hemp_decodescript(&hex::encode(&legacy_script)).unwrap_or_default();
-            
-            if offer.htlc_address == p2sh_normal {
-                htlc_script = htlc_script_funded_by_offeror;
-                refund_signing_address = refund_to_address.clone();
-                refund_signing_chain = refund_chain.clone();
-            } else if offer.htlc_address == p2sh_legacy {
+            if offer.htlc_address == decode_p2sh_for_chain(&refund_chain, &script_correct) {
+                htlc_script = script_correct;
+            } else if offer.htlc_address == decode_p2sh_for_chain(&refund_chain, &script_self) {
+                htlc_script = script_self;
+            } else if offer.htlc_address == decode_p2sh_for_chain(&refund_chain, &legacy_script) {
                 htlc_script = legacy_script;
-                refund_signing_address = refund_to_address.clone();
-                refund_signing_chain = refund_chain.clone();
             } else {
-                // Wait, it might have been accepted, but if we're refunding our own HTLC, it shouldn't have changed.
-                // If it DID change, try the other combinations just in case!
-                let htlc_script_with_recipient = build_htlc_script(&secret_hash_bytes, &sender_pubkey_hash, &recipient_pubkey_hash, locktime);
-                htlc_script = htlc_script_with_recipient;
-                refund_signing_address = refund_to_address.clone();
-                refund_signing_chain = refund_chain.clone();
+                htlc_script = script_correct;
             }
         } else {
             // Acceptor refunds their own HTLC on want_chain
-            if acceptance.is_none() {
-                return Err("No acceptance found to refund".to_string());
-            }
-            let acc = acceptance.as_ref().unwrap();
+            let acc = acceptance.as_ref().ok_or("No acceptance found to refund")?;
             refund_chain = offer.want_chain.clone();
-            refund_amount = offer.want_amount;
             
-            let acceptor_refund = acc.acceptor_refund_address.clone().unwrap_or(acc.want_address.clone());
+            let acceptor_refund = acc.acceptor_refund_address.clone().unwrap_or_else(|| acc.want_address.clone());
             refund_to_address = acceptor_refund.clone();
             
             htlc_txid = acc.accept_htlc_txid.clone();
@@ -1324,30 +1339,19 @@ pub async fn swap_refund(swap_id: String) -> Result<String, String> {
             let secret_hash_bytes = hex::decode(&offer.secret_hash)
                 .map_err(|e| format!("Invalid secret hash: {e}"))?;
                 
-            let htlc_script_normal = build_htlc_script(&secret_hash_bytes, &recipient_pubkey_hash, &sender_pubkey_hash, locktime);
+            let script_correct = build_htlc_script(&secret_hash_bytes, &sender_pubkey_hash, &recipient_pubkey_hash, locktime);
+            let script_reversed = build_htlc_script(&secret_hash_bytes, &recipient_pubkey_hash, &sender_pubkey_hash, locktime);
             let legacy_script = build_legacy_htlc_script(&secret_hash_bytes, &sender_pubkey_hash, locktime);
             
-            let p2sh_normal = if refund_chain == "hemp" {
-                crate::modules::atomic_swap::hemp_decodescript(&hex::encode(&htlc_script_normal)).unwrap_or_default()
-            } else {
-                crate::modules::atomic_swap::rvn_decodescript(&hex::encode(&htlc_script_normal)).unwrap_or_default()
-            };
-            
-            let p2sh_legacy = if refund_chain == "hemp" {
-                crate::modules::atomic_swap::hemp_decodescript(&hex::encode(&legacy_script)).unwrap_or_default()
-            } else {
-                crate::modules::atomic_swap::rvn_decodescript(&hex::encode(&legacy_script)).unwrap_or_default()
-            };
-            
-            if htlc_address == p2sh_normal {
-                htlc_script = htlc_script_normal;
-            } else if htlc_address == p2sh_legacy {
+            if htlc_address == decode_p2sh_for_chain(&refund_chain, &script_correct) {
+                htlc_script = script_correct;
+            } else if htlc_address == decode_p2sh_for_chain(&refund_chain, &script_reversed) {
+                htlc_script = script_reversed;
+            } else if htlc_address == decode_p2sh_for_chain(&refund_chain, &legacy_script) {
                 htlc_script = legacy_script;
             } else {
-                htlc_script = htlc_script_normal;
+                htlc_script = script_correct;
             }
-            refund_signing_address = refund_to_address.clone();
-            refund_signing_chain = refund_chain.clone();
         }
 
         let now = now_epoch();
@@ -1364,7 +1368,7 @@ pub async fn swap_refund(swap_id: String) -> Result<String, String> {
         }
 
         // 1. Find the UTXO
-        let (vout, amount, spk_hex) = if refund_chain == "hemp" {
+        let (vout, amount, _) = if refund_chain == "hemp" {
             hemp_find_utxo(&htlc_txid, &htlc_address)?
         } else {
             rvn_find_utxo(&htlc_txid, &htlc_address)?
@@ -1377,45 +1381,32 @@ pub async fn swap_refund(swap_id: String) -> Result<String, String> {
         }
         let send_amount = amount - fee;
 
-        let inputs = serde_json::json!([{"txid": htlc_txid, "vout": vout, "sequence": locktime}]); // sequence must be >= locktime for OP_CHECKLOCKTIMEVERIFY
         let outputs = serde_json::json!({refund_to_address.clone(): send_amount});
-
-        // For refund, set locktime field in the tx to `locktime`
-        // createrawtransaction sets locktime to 0 by default. We can use a hack or build it.
-        // Actually, Bitcoin's createrawtransaction supports a 3rd argument for locktime!
         let inputs_val = serde_json::json!([{"txid": htlc_txid, "vout": vout, "sequence": 4294967294u32}]); // 0xfffffffe enables nLockTime but disables BIP68
         
         let raw_tx = if refund_chain == "hemp" {
-            let res = rpc::call_rpc("createrawtransaction", &[inputs_val, outputs.clone(), serde_json::json!(locktime)])?;
+            let res = rpc::call_rpc("createrawtransaction", &[inputs_val, outputs, serde_json::json!(locktime)])?;
             res.as_str().ok_or("Failed to parse raw tx from Hemp node")?.to_string()
         } else {
-            let res = rvn_rpc::call_rvn_rpc("createrawtransaction", &[inputs_val, outputs.clone(), serde_json::json!(locktime)])?;
+            let res = rvn_rpc::call_rvn_rpc("createrawtransaction", &[inputs_val, outputs, serde_json::json!(locktime)])?;
             res.as_str().ok_or("Failed to parse raw tx from RVN node")?.to_string()
         };
 
         // 4. Sign and Inject scriptSig for Refund
-        let privkey_res = if refund_signing_chain == "hemp" {
-            crate::modules::rpc::call_rpc("dumpprivkey", &[serde_json::Value::String(refund_signing_address.clone())])
+        let privkey_res = if refund_chain == "hemp" {
+            crate::modules::rpc::call_active_wallet_or_default("dumpprivkey", &[serde_json::Value::String(refund_to_address.clone())])
         } else {
-            crate::modules::rvn_rpc::call_rvn_rpc("dumpprivkey", &[serde_json::Value::String(refund_signing_address.clone())])
+            crate::modules::rvn_rpc::call_rvn_rpc("dumpprivkey", &[serde_json::Value::String(refund_to_address.clone())])
         };
-        let privkey_value = privkey_res.map_err(|e| format!("Wallet must be unlocked to sign: {e}"))?;
+        let privkey_value = privkey_res.map_err(|e| format!("Wallet must be unlocked to sign ({refund_chain}): {e}"))?;
         let privkey = privkey_value.as_str().ok_or("Invalid WIF returned")?.to_string();
 
         let raw_tx_bytes = hex::decode(&raw_tx).map_err(|e| format!("Invalid hex tx: {e}"))?;
         let sighash = build_sighash_all(&raw_tx_bytes, &htlc_script)?;
         let (signature, pubkey) = sign_sighash(&privkey, &sighash)?;
 
-        println!("DEBUG REFUND - raw_tx: {}", raw_tx);
-        println!("DEBUG REFUND - htlc_script: {}", hex::encode(&htlc_script));
-        println!("DEBUG REFUND - sighash: {}", hex::encode(&sighash));
-        println!("DEBUG REFUND - signature: {}", hex::encode(&signature));
-        println!("DEBUG REFUND - pubkey: {}", hex::encode(&pubkey));
-
         let refund_script_sig = build_refund_script_sig(&signature, &pubkey, &htlc_script);
         let signed_tx = inject_script_sig(&raw_tx, &refund_script_sig)?;
-        
-        println!("DEBUG REFUND - signed_tx: {}", signed_tx);
 
         // 5. Broadcast
         let txid = if refund_chain == "hemp" {
@@ -1442,8 +1433,13 @@ pub async fn swap_delete(swap_id: String) -> Result<String, String> {
         .get(&swap_id)
         .ok_or_else(|| format!("Swap not found: {swap_id}"))?;
 
-    if record.phase != "completed" && record.phase != "refunded" && record.phase != "created" && record.phase != "intent" {
-        return Err("Can only delete completed, refunded, or unfunded swaps.".to_string());
+    if record.phase != "completed"
+        && record.phase != "claimed"
+        && record.phase != "refunded"
+        && record.phase != "created"
+        && record.phase != "intent"
+    {
+        return Err("Can only delete completed, claimed, refunded, or unfunded swaps.".to_string());
     }
 
     store.remove(&swap_id);

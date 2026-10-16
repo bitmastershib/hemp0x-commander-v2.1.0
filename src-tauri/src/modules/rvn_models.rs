@@ -34,6 +34,7 @@ pub struct RvnTxItem {
     pub amount: String,
     pub conf: u64,
     pub txid: String,
+    pub asset: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -98,6 +99,8 @@ pub struct SwapOffer {
     pub want_amount: f64,
     pub want_asset: Option<String>,
     pub want_address: String,
+    #[serde(default)]
+    pub acceptor_want_address: Option<String>,
     pub htlc_address: String,
     pub htlc_txid: String,
     pub locktime: u64,

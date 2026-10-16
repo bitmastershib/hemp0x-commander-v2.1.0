@@ -176,7 +176,7 @@
             <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 5px;">
                 <div style="display: flex; align-items: center; gap: 10px;">
                     {#if $rvnWalletInfo.status !== '--' && $rvnWalletInfo.status !== 'UNENCRYPTED'}
-                        <div class="rvn-status-badge" style="background: {$rvnWalletInfo.status === 'UNLOCKED' ? 'rgba(46, 204, 113, 0.1)' : 'rgba(231, 76, 60, 0.1)'}; color: {$rvnWalletInfo.status === 'UNLOCKED' ? '#2ecc71' : '#e74c3c'}; border-color: {$rvnWalletInfo.status === 'UNLOCKED' ? '#2ecc71' : '#e74c3c'}; display: flex; align-items: center; gap: 5px; cursor: pointer;" on:click={handleManualLockToggle} title="Click to {$rvnWalletInfo.status === 'UNLOCKED' ? 'lock' : 'unlock'} wallet">
+                        <div class="rvn-status-badge" role="button" tabindex="0" style="background: {$rvnWalletInfo.status === 'UNLOCKED' ? 'rgba(46, 204, 113, 0.1)' : 'rgba(231, 76, 60, 0.1)'}; color: {$rvnWalletInfo.status === 'UNLOCKED' ? '#2ecc71' : '#e74c3c'}; border-color: {$rvnWalletInfo.status === 'UNLOCKED' ? '#2ecc71' : '#e74c3c'}; display: flex; align-items: center; gap: 5px; cursor: pointer;" on:click={handleManualLockToggle} on:keydown={(e) => (e.key === 'Enter' || e.key === ' ') && handleManualLockToggle()} title="Click to {$rvnWalletInfo.status === 'UNLOCKED' ? 'lock' : 'unlock'} wallet">
                             {#if $rvnWalletInfo.status === 'UNLOCKED'}
                                 🔓 RVN Wallet Unlocked
                             {:else}

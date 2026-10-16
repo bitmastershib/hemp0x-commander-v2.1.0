@@ -2536,6 +2536,7 @@ pub fn get_daemon_repair_mode() -> Result<String, String> {
 }
 
 const REQUIRED_CORE_BINS: &[&str] = &["hemp0xd", "hemp0x-cli"];
+#[allow(dead_code)]
 const OPTIONAL_CORE_BINS: &[&str] = &["hemp0x-tx"];
 
 #[tauri::command]

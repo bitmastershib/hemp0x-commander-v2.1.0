@@ -449,6 +449,7 @@ pub fn run() {
             atomic_swap::swap_lock_initiator,
             atomic_swap::swap_create_offer,
             atomic_swap::swap_accept_offer,
+            atomic_swap::swap_finalize_offer,
             atomic_swap::swap_status,
             atomic_swap::swap_list,
             atomic_swap::swap_claim,

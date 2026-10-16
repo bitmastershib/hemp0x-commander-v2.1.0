@@ -94,6 +94,7 @@ impl DaemonProcessIdentity {
     }
 }
 
+#[allow(dead_code)]
 fn bundled_daemon_path() -> PathBuf {
     let custom_bin_dir = load_app_settings_impl()
         .ok()
@@ -149,10 +150,12 @@ fn find_pid_by_port(port: u16) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 fn find_pid_by_port(_port: u16) -> Option<u32> {
     None
 }
 
+#[allow(dead_code)]
 fn compute_sha256(path: &Path) -> Result<String, String> {
     use sha2::{Digest, Sha256};
     let mut file = fs::File::open(path).map_err(|e| format!("SHA256 open error: {e}"))?;

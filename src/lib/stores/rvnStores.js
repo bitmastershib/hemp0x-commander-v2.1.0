@@ -2,6 +2,7 @@ import { writable } from 'svelte/store';
 
 export const rvnNodeStatus = writable({
     online: false, 
+    synced: false,
     version: "--", 
     connections: 0,
     headers: 0, 

@@ -16,8 +16,8 @@
     let statusText = '';
     let unlisten = null;
 
-    const chainLabel = chain === 'ravencoin' ? 'Ravencoin' : 'Hemp0x';
-    const primaryColor = chain === 'ravencoin' ? '#ff6b00' : '#00e676';
+    $: chainLabel = chain === 'ravencoin' ? 'Ravencoin' : 'Hemp0x';
+    $: primaryColor = chain === 'ravencoin' ? '#ff6b00' : '#00e676';
 
     function humanBytes(bytes) {
         if (!bytes || bytes <= 0) return '0 B';
@@ -285,7 +285,7 @@
 
     <footer class="modal-footer">
         {#if isWorking}
-            {#if currentStage === 'downloading'}
+            {#if currentStage === 'downloading' || currentStage === 'download'}
                 <button class="btn ghost" on:click={handleCancel}>Pause Download</button>
             {/if}
             <button class="btn primary" disabled>

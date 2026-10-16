@@ -34,8 +34,67 @@ let privKeyBytes;
 let pubKeyHex;
 let subOffers;
 let subAccepts;
+const inFlightEvents = new Set();
+
+function getProcessedEvents() {
+    try {
+        return new Set(JSON.parse(localStorage.getItem('hemp0x_nostr_processed_events') || '[]'));
+    } catch {
+        return new Set();
+    }
+}
+
+function markEventProcessed(eventId) {
+    try {
+        const set = getProcessedEvents();
+        set.add(eventId);
+        const arr = Array.from(set).slice(-500);
+        localStorage.setItem('hemp0x_nostr_processed_events', JSON.stringify(arr));
+    } catch {}
+}
+
+function savePendingAccept(swapId, wantAddress, offerAddress) {
+    try {
+        const map = JSON.parse(localStorage.getItem('hemp0x_pending_accepts') || '{}');
+        map[swapId] = { wantAddress, offerAddress };
+        localStorage.setItem('hemp0x_pending_accepts', JSON.stringify(map));
+    } catch {}
+}
+
+function getPendingAccept(swapId) {
+    try {
+        const map = JSON.parse(localStorage.getItem('hemp0x_pending_accepts') || '{}');
+        return map[swapId] || null;
+    } catch {
+        return null;
+    }
+}
+
+function isWalletLockedError(err) {
+    const text = String(err || "").toLowerCase();
+    return text.includes("error code: -13")
+        || text.includes("walletpassphrase")
+        || text.includes("wallet passphrase")
+        || text.includes("please enter the wallet passphrase")
+        || /wallet.*locked|passphrase|unlock/i.test(text);
+}
+
+function notifyUnlockNeeded(err, retryFn) {
+    const text = String(err || "");
+    const chain = text.toLowerCase().includes("rvn") || text.toLowerCase().includes("ravencoin") ? "rvn" : "hemp";
+    window.dispatchEvent(new CustomEvent('hemp0x_swap_unlock_needed', {
+        detail: { chain, retryFn, error: text }
+    }));
+}
 
 export async function initNostr() {
+    if (subOffers) {
+        try { subOffers.close(); } catch {}
+    }
+    if (subAccepts) {
+        try { subAccepts.close(); } catch {}
+    }
+
     // 1. Manage Keys
     let storedPrivKey = localStorage.getItem('hemp0x_nostr_privkey');
     if (!storedPrivKey) {
@@ -95,7 +154,7 @@ export async function initNostr() {
 }
 
 export async function syncLocalIntentOffers(swaps) {
-    if (!Array.isArray(swaps) || !privKeyBytes) return;
+    if (!Array.isArray(swaps) || !privKeyBytes || !pool) return;
     const currentOffers = get(nostrState).offers;
     for (const swap of swaps) {
         if (swap.phase === 'intent' && swap.offer_code) {
@@ -127,7 +186,7 @@ function processGlobalEvent(event) {
             if (!data.swap_id || !data.offer_chain || !data.want_chain) return;
 
             nostrState.update(s => {
-                if (s.offers.find(o => o.id === event.id || o.rawData.swap_id === data.swap_id)) return s;
+                if (s.offers.find(o => o.id === event.id || o.rawData?.swap_id === data.swap_id)) return s;
 
                 let newOffer = {
                     id: event.id,
@@ -146,20 +205,22 @@ function processGlobalEvent(event) {
                 return { ...s, offers: [...s.offers, newOffer].sort((a, b) => b.created_at - a.created_at) };
             });
         } catch (e) {}
-    } else if (event.kind === 13338 || event.kind === 13339 || event.kind === 13340) {
-        // Someone accepted or funded an offer. Remove it from the marketplace!
-        let offerEventIdTag = event.tags.find(t => t[0] === 'e');
-        if (offerEventIdTag) {
-            let offerIdToRemove = offerEventIdTag[1];
-            nostrState.update(s => ({
-                ...s,
-                offers: s.offers.filter(o => o.id !== offerIdToRemove)
-            }));
-        }
+    } else if (event.kind === 13339 || event.kind === 13340) {
+        // Remove an offer from the marketplace once it is funded
+        try {
+            let data = JSON.parse(atob(event.content));
+            if (data.swap_id) {
+                removeLocalOffer(data.swap_id);
+            }
+        } catch (e) {}
     }
 }
 
 async function processIncomingEvent(event) {
+    if (!event?.id) return;
+    if (inFlightEvents.has(event.id) || getProcessedEvents().has(event.id)) return;
+    inFlightEvents.add(event.id);
+
     try {
         let jsonStr = atob(event.content);
         let data = JSON.parse(jsonStr);
@@ -167,67 +228,91 @@ async function processIncomingEvent(event) {
         if (event.kind === 13338) {
             // STEP 2: Initiator receives Acceptor's Handshake
             if (!data.swap_id || !data.want_address) return;
-            console.log("Phase 3: Received Handshake for swap", data.swap_id);
             try {
-                let updatedOfferCode = await invoke('swap_lock_initiator', { swapId: data.swap_id, acceptorWantAddress: data.want_address });
-                console.log("Phase 3: Initiator locked funds. Publishing 13339...");
-                await publishHTLCFunded(event.id, event.pubkey, updatedOfferCode);
+                let updatedOfferCode = await invoke('swap_lock_initiator', {
+                    swapId: data.swap_id,
+                    acceptorWantAddress: data.want_address
+                });
+                await publishHTLCFunded(event.id, event.pubkey, updatedOfferCode, data.want_address, data.offer_address);
+                markEventProcessed(event.id);
+                removeLocalOffer(data.swap_id);
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
             } catch (err) {
-                console.warn("Failed to lock initiator funds:", err);
+                if (isWalletLockedError(err)) {
+                    notifyUnlockNeeded(err, () => processIncomingEvent(event));
+                } else {
+                    console.warn("Failed to lock initiator funds:", err);
+                }
             }
         } else if (event.kind === 13339) {
             // STEP 3: Acceptor receives Initiator's HTLC Funded
-            if (!data.offer_code || !data.offer_address || !data.want_address) return;
-            console.log("Phase 3: Received HTLC Funded for swap. Acceptor is locking...");
+            if (!data.offer_code || !data.swap_id) return;
+            const pending = getPendingAccept(data.swap_id);
+            const acceptorWantAddress = pending?.wantAddress || data.acceptor_want_address || data.want_address;
+            const acceptorOfferAddress = pending?.offerAddress || data.acceptor_offer_address || data.offer_address;
+            if (!acceptorWantAddress || !acceptorOfferAddress) return;
+
             try {
                 let acceptCode = await invoke('swap_accept_offer', {
                     offerCode: data.offer_code,
-                    wantAddress: data.want_address,
-                    offerAddress: data.offer_address
+                    wantAddress: acceptorWantAddress,
+                    offerAddress: acceptorOfferAddress
                 });
-                console.log("Phase 3: Acceptor locked funds. Publishing 13340...");
                 await publishCounterHTLCFunded(event.id, event.pubkey, acceptCode, data.swap_id);
+                markEventProcessed(event.id);
+                removeLocalOffer(data.swap_id);
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
             } catch (err) {
-                console.warn("Failed to lock acceptor funds:", err);
+                if (isWalletLockedError(err)) {
+                    notifyUnlockNeeded(err, () => processIncomingEvent(event));
+                } else {
+                    console.warn("Failed to lock acceptor funds:", err);
+                }
             }
         } else if (event.kind === 13340) {
             // STEP 4: Initiator receives Acceptor's Counter-HTLC Funded
             if (!data.swap_id || !data.accept_code) return;
-            console.log("Phase 3: Received Counter-HTLC Funded for swap", data.swap_id);
             try {
                 await invoke('swap_finalize_offer', { swapId: data.swap_id, acceptCode: data.accept_code });
+                window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
                 let claimRes = await invoke('swap_claim', { swapId: data.swap_id, providedSecret: null });
-                console.log("Phase 3: Initiator Claimed!", claimRes);
                 
-                // Extract secret from claimRes string (e.g. "... funds: <secret_hex>")
+                // Extract secret from claimRes string
                 let secretMatch = claimRes.match(/([a-f0-9]{64})$/i);
                 if (secretMatch && secretMatch[1]) {
-                    console.log("Phase 3: Extracted secret. Broadcasting 13341...");
                     await publishSecretReveal(event.id, event.pubkey, data.swap_id, secretMatch[1]);
                 }
 
+                markEventProcessed(event.id);
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_autoclaimed', { detail: { swap_id: data.swap_id } }));
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
             } catch (err) {
-                console.warn("Failed to finalize and claim:", err);
+                if (isWalletLockedError(err)) {
+                    notifyUnlockNeeded(err, () => processIncomingEvent(event));
+                } else {
+                    console.warn("Failed to finalize and claim:", err);
+                }
             }
         } else if (event.kind === 13341) {
             // STEP 5: Acceptor receives Initiator's Secret Reveal
             if (!data.swap_id || !data.secret) return;
-            console.log("Phase 3: Received Secret Reveal for swap", data.swap_id);
             try {
                 await invoke('swap_claim', { swapId: data.swap_id, providedSecret: data.secret });
-                console.log("Phase 3: Acceptor Claimed!");
+                markEventProcessed(event.id);
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_autoclaimed', { detail: { swap_id: data.swap_id } }));
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
             } catch (err) {
-                console.warn("Failed to execute acceptor claim:", err);
+                if (isWalletLockedError(err)) {
+                    notifyUnlockNeeded(err, () => processIncomingEvent(event));
+                } else {
+                    console.warn("Failed to execute acceptor claim:", err);
+                }
             }
         }
     } catch (e) {
         // Invalid content
+    } finally {
+        inFlightEvents.delete(event.id);
     }
 }
 
@@ -256,6 +341,8 @@ export async function publishOffer(offerCodeBase64) {
 export async function publishHandshakeAccept(offerEventId, offerPubkey, swapId, wantAddress, offerAddress) {
     if (!pool || !privKeyBytes) throw new Error("Nostr not initialized");
 
+    savePendingAccept(swapId, wantAddress, offerAddress);
+
     let payload = btoa(JSON.stringify({
         swap_id: swapId,
         want_address: wantAddress,
@@ -278,7 +365,7 @@ export async function publishHandshakeAccept(offerEventId, offerPubkey, swapId, 
     return signedEvent.id;
 }
 
-export async function publishHTLCFunded(handshakeEventId, acceptorPubkey, updatedOfferCodeBase64) {
+export async function publishHTLCFunded(handshakeEventId, acceptorPubkey, updatedOfferCodeBase64, acceptorWantAddress = null, acceptorOfferAddress = null) {
     if (!pool || !privKeyBytes) throw new Error("Nostr not initialized");
 
     // Extract JSON from the base64 offer code to send structured data
@@ -286,8 +373,10 @@ export async function publishHTLCFunded(handshakeEventId, acceptorPubkey, update
     let payload = btoa(JSON.stringify({
         swap_id: offerData.swap_id,
         offer_code: updatedOfferCodeBase64,
-        want_address: offerData.want_address,
-        offer_address: offerData.offer_address
+        want_address: acceptorWantAddress || offerData.acceptor_want_address || offerData.want_address,
+        offer_address: acceptorOfferAddress || offerData.offer_address,
+        acceptor_want_address: acceptorWantAddress || offerData.acceptor_want_address || null,
+        acceptor_offer_address: acceptorOfferAddress || null
     }));
 
     let event = {
