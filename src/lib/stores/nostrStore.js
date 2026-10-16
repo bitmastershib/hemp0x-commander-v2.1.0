@@ -18,7 +18,9 @@ function bytesToHex(bytes) {
 const RELAYS = [
     'wss://relay.damus.io',
     'wss://nos.lol',
-    'wss://relay.primal.net'
+    'wss://relay.primal.net',
+    'wss://offchain.pub',
+    'wss://nostr.mom'
 ];
 
 export const nostrState = writable({
@@ -47,9 +49,8 @@ export async function initNostr() {
     nostrState.update(s => ({ ...s, pubkey: pubKeyHex }));
 
     // 2. Connect to Relays
-    pool = new SimplePool();
+    pool = new SimplePool({ enablePing: true, enableReconnect: true });
     
-    // We can consider connected if at least one relay works, but SimplePool abstracts this.
     nostrState.update(s => ({ ...s, isConnected: true }));
 
     // 3. Subscribe to the Marketplace (Offers and Accepts globally)
@@ -83,6 +84,38 @@ export async function initNostr() {
             }
         }
     );
+
+    // 5. Re-broadcast and display any active local intent offers
+    try {
+        const localSwaps = await invoke('swap_list');
+        await syncLocalIntentOffers(localSwaps);
+    } catch (e) {
+        // Ignore startup swap_list errors
+    }
+}
+
+export async function syncLocalIntentOffers(swaps) {
+    if (!Array.isArray(swaps) || !privKeyBytes) return;
+    const currentOffers = get(nostrState).offers;
+    for (const swap of swaps) {
+        if (swap.phase === 'intent' && swap.offer_code) {
+            const alreadyListed = currentOffers.some(o => o.rawData?.swap_id === swap.swap_id);
+            if (!alreadyListed) {
+                try {
+                    await publishOffer(swap.offer_code);
+                } catch (e) {
+                    // Local offer is still added by publishOffer before relay broadcast
+                }
+            }
+        }
+    }
+}
+
+export function removeLocalOffer(swapId) {
+    nostrState.update(s => ({
+        ...s,
+        offers: s.offers.filter(o => o.rawData?.swap_id !== swapId)
+    }));
 }
 
 function processGlobalEvent(event) {
@@ -136,7 +169,7 @@ async function processIncomingEvent(event) {
             if (!data.swap_id || !data.want_address) return;
             console.log("Phase 3: Received Handshake for swap", data.swap_id);
             try {
-                let updatedOfferCode = await invoke('swap_lock_initiator', { swap_id: data.swap_id, acceptor_want_address: data.want_address });
+                let updatedOfferCode = await invoke('swap_lock_initiator', { swapId: data.swap_id, acceptorWantAddress: data.want_address });
                 console.log("Phase 3: Initiator locked funds. Publishing 13339...");
                 await publishHTLCFunded(event.id, event.pubkey, updatedOfferCode);
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
@@ -211,6 +244,9 @@ export async function publishOffer(offerCodeBase64) {
     };
 
     let signedEvent = finalizeEvent(event, privKeyBytes);
+
+    // Immediately add to local Global Public Offers state
+    processGlobalEvent(signedEvent);
     
     // Publish to all relays
     await Promise.any(pool.publish(RELAYS, signedEvent));

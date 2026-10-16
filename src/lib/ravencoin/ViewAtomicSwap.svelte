@@ -2,7 +2,7 @@
     import { onMount, onDestroy } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
     import { activeSwaps, swapWizardState } from '../stores/swapStores.js';
-    import { nostrState, publishOffer, publishHandshakeAccept } from '../stores/nostrStore.js';
+    import { nostrState, publishOffer, publishHandshakeAccept, syncLocalIntentOffers, removeLocalOffer } from '../stores/nostrStore.js';
     import { addToastNotification } from '../stores/notifications.js';
 
     let loadError = null;
@@ -84,6 +84,7 @@
         try {
             const swaps = await invoke('swap_list');
             activeSwaps.set(swaps);
+            syncLocalIntentOffers(swaps);
         } catch (e) {
             loadError = e.toString();
         }
@@ -189,6 +190,9 @@
                 await invoke(action, { swapId, acceptCode: extraArg });
             } else {
                 await invoke(action, { swapId });
+            }
+            if (action === 'swap_delete') {
+                removeLocalOffer(swapId);
             }
             loadSwaps();
         } catch (e) {

@@ -1034,6 +1034,7 @@ pub async fn swap_list() -> Result<Vec<SwapSummary>, String> {
         .map(|record| SwapSummary {
             swap_id: record.offer.swap_id.clone(),
             phase: record.phase.clone(),
+            offer_code: record.offer.offer_code.clone(),
             offer_chain: record.offer.offer_chain.clone(),
             offer_amount: record.offer.offer_amount,
             offer_asset: record.offer.offer_asset.clone(),
@@ -1441,7 +1442,7 @@ pub async fn swap_delete(swap_id: String) -> Result<String, String> {
         .get(&swap_id)
         .ok_or_else(|| format!("Swap not found: {swap_id}"))?;
 
-    if record.phase != "completed" && record.phase != "refunded" && record.phase != "created" {
+    if record.phase != "completed" && record.phase != "refunded" && record.phase != "created" && record.phase != "intent" {
         return Err("Can only delete completed, refunded, or unfunded swaps.".to_string());
     }
 

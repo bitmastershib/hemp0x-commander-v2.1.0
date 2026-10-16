@@ -144,6 +144,7 @@ pub struct SwapStatus {
 pub struct SwapSummary {
     pub swap_id: String,
     pub phase: String,
+    pub offer_code: String,
     pub offer_chain: String,
     pub offer_amount: f64,
     pub offer_asset: Option<String>,
