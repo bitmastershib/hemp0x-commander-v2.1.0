@@ -16,57 +16,70 @@ function bytesToHex(bytes) {
 }
 
 const RELAYS = [
-    'wss://relay.damus.io',
-    'wss://nos.lol',
     'wss://relay.primal.net',
+    'wss://nos.lol',
+    'wss://nostr.mom',
     'wss://offchain.pub',
-    'wss://nostr.mom'
+    'wss://relay.damus.io'
 ];
 
 export const nostrState = writable({
     isConnected: false,
     pubkey: null,
-    offers: [] // Array of { id, pubkey, created_at, content, offer_chain, want_chain, offer_amount, want_amount, rawData }
+    offers: [], // Array of { id, pubkey, created_at, content, offer_chain, want_chain, offer_amount, want_amount, rawData }
+    pendingAccepts: [] // Array of { swap_id, offer_chain, offer_amount, want_chain, want_amount, created_at }
 });
 
 let pool;
 let privKeyBytes;
 let pubKeyHex;
-let subOffers;
-let subAccepts;
+let pollTimer = null;
+let initialRelaySyncDone = false;
+const relaySockets = new Map();
 const inFlightEvents = new Set();
+const closedSwapsMem = new Set();
+const processedEventsMem = new Set();
+const syncedIntentSwaps = new Set();
+
+function loadPersistedSets() {
+    try {
+        const closed = JSON.parse(localStorage.getItem('hemp0x_closed_swaps') || '[]');
+        if (Array.isArray(closed)) {
+            for (const id of closed) closedSwapsMem.add(id);
+        }
+    } catch {}
+    try {
+        const proc = JSON.parse(localStorage.getItem('hemp0x_nostr_processed_events') || '[]');
+        if (Array.isArray(proc)) {
+            for (const id of proc) processedEventsMem.add(id);
+        }
+    } catch {}
+}
 
 function getProcessedEvents() {
-    try {
-        return new Set(JSON.parse(localStorage.getItem('hemp0x_nostr_processed_events') || '[]'));
-    } catch {
-        return new Set();
-    }
+    if (processedEventsMem.size === 0) loadPersistedSets();
+    return processedEventsMem;
 }
 
 function markEventProcessed(eventId) {
+    if (!eventId) return;
+    processedEventsMem.add(eventId);
     try {
-        const set = getProcessedEvents();
-        set.add(eventId);
-        const arr = Array.from(set).slice(-500);
+        const arr = Array.from(processedEventsMem).slice(-500);
         localStorage.setItem('hemp0x_nostr_processed_events', JSON.stringify(arr));
     } catch {}
 }
 
 function getClosedSwaps() {
-    try {
-        return new Set(JSON.parse(localStorage.getItem('hemp0x_closed_swaps') || '[]'));
-    } catch {
-        return new Set();
-    }
+    if (closedSwapsMem.size === 0) loadPersistedSets();
+    return closedSwapsMem;
 }
 
-function markSwapClosed(swapId) {
+export function markSwapClosed(swapId) {
     if (!swapId) return;
+    closedSwapsMem.add(swapId);
     try {
-        const set = getClosedSwaps();
-        set.add(swapId);
-        const arr = Array.from(set).slice(-500);
+        const arr = Array.from(closedSwapsMem).slice(-500);
         localStorage.setItem('hemp0x_closed_swaps', JSON.stringify(arr));
     } catch {}
 }
@@ -76,11 +89,51 @@ export function isSwapClosed(swapId) {
     return getClosedSwaps().has(swapId);
 }
 
-function savePendingAccept(swapId, wantAddress, offerAddress) {
+function refreshPendingAcceptsStore() {
     try {
         const map = JSON.parse(localStorage.getItem('hemp0x_pending_accepts') || '{}');
-        map[swapId] = { wantAddress, offerAddress };
+        const nowSec = Math.floor(Date.now() / 1000);
+        const list = Object.entries(map)
+            .filter(([_, v]) => v && !v.funded && (!v.created_at || (nowSec - v.created_at) < 3600))
+            .map(([swap_id, v]) => ({
+                swap_id,
+                phase: 'handshake',
+                offer_chain: v.offer_chain || 'rvn',
+                offer_amount: v.offer_amount || 0,
+                want_chain: v.want_chain || 'hemp',
+                want_amount: v.want_amount || 0,
+                created_at: v.created_at || nowSec
+            }));
+        nostrState.update(s => ({ ...s, pendingAccepts: list }));
+    } catch {}
+}
+
+function savePendingAccept(swapId, wantAddress, offerAddress, offerMeta = null) {
+    try {
+        const map = JSON.parse(localStorage.getItem('hemp0x_pending_accepts') || '{}');
+        map[swapId] = {
+            wantAddress,
+            offerAddress,
+            offer_chain: offerMeta?.offer_chain || map[swapId]?.offer_chain || 'rvn',
+            offer_amount: offerMeta?.offer_amount ?? map[swapId]?.offer_amount ?? 0,
+            want_chain: offerMeta?.want_chain || map[swapId]?.want_chain || 'hemp',
+            want_amount: offerMeta?.want_amount ?? map[swapId]?.want_amount ?? 0,
+            created_at: map[swapId]?.created_at || Math.floor(Date.now() / 1000),
+            funded: false
+        };
         localStorage.setItem('hemp0x_pending_accepts', JSON.stringify(map));
+        refreshPendingAcceptsStore();
+    } catch {}
+}
+
+function markPendingAcceptFunded(swapId) {
+    try {
+        const map = JSON.parse(localStorage.getItem('hemp0x_pending_accepts') || '{}');
+        if (map[swapId]) {
+            map[swapId].funded = true;
+            localStorage.setItem('hemp0x_pending_accepts', JSON.stringify(map));
+            refreshPendingAcceptsStore();
+        }
     } catch {}
 }
 
@@ -110,12 +163,121 @@ function notifyUnlockNeeded(err, retryFn) {
     }));
 }
 
-export async function initNostr() {
-    if (subOffers) {
-        try { subOffers.close(); } catch {}
+function sendRelaySubscriptions(ws) {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !pubKeyHex) return;
+    const since24h = Math.floor(Date.now() / 1000) - (24 * 60 * 60);
+    try {
+        ws.send(JSON.stringify([
+            "REQ",
+            "hemp0x_all",
+            {
+                kinds: [13337, 13338, 13339, 13340, 13341],
+                "#t": ["hemp0x_swap", "hemp0x_swap_handshake", "hemp0x_swap_funded", "hemp0x_swap_counter_funded", "hemp0x_swap_secret"],
+                since: since24h
+            }
+        ]));
+        ws.send(JSON.stringify([
+            "REQ",
+            "hemp0x_dm",
+            {
+                kinds: [13338, 13339, 13340, 13341],
+                "#p": [pubKeyHex],
+                since: since24h
+            }
+        ]));
+    } catch {}
+}
+
+function updateConnectionStatus() {
+    let anyOpen = false;
+    for (const ws of relaySockets.values()) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            anyOpen = true;
+            break;
+        }
     }
-    if (subAccepts) {
-        try { subAccepts.close(); } catch {}
+    nostrState.update(s => (s.isConnected === anyOpen ? s : { ...s, isConnected: anyOpen }));
+}
+
+function connectRelaySocket(url) {
+    const existing = relaySockets.get(url);
+    if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
+        return;
+    }
+
+    try {
+        const ws = new WebSocket(url);
+        relaySockets.set(url, ws);
+
+        ws.onopen = () => {
+            updateConnectionStatus();
+            sendRelaySubscriptions(ws);
+        };
+
+        ws.onmessage = (msg) => {
+            try {
+                const parsed = JSON.parse(msg.data);
+                if (!Array.isArray(parsed)) return;
+                if (parsed[0] === "EVENT" && parsed[2]) {
+                    const event = parsed[2];
+                    processGlobalEvent(event);
+                    if (
+                        event.kind >= 13338 &&
+                        event.kind <= 13341 &&
+                        event.pubkey !== pubKeyHex &&
+                        Array.isArray(event.tags) &&
+                        event.tags.some(t => t[0] === "p" && t[1] === pubKeyHex)
+                    ) {
+                        processIncomingEvent(event);
+                    }
+                }
+            } catch {}
+        };
+
+        ws.onerror = () => {
+            try { ws.close(); } catch {}
+        };
+
+        ws.onclose = () => {
+            if (relaySockets.get(url) === ws) {
+                relaySockets.delete(url);
+            }
+            updateConnectionStatus();
+            setTimeout(() => connectRelaySocket(url), 3000);
+        };
+    } catch {
+        setTimeout(() => connectRelaySocket(url), 3000);
+    }
+}
+
+async function broadcastSignedEvent(signedEvent) {
+    let sentViaWs = false;
+    const msg = JSON.stringify(["EVENT", signedEvent]);
+    for (const ws of relaySockets.values()) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            try {
+                ws.send(msg);
+                sentViaWs = true;
+            } catch {}
+        }
+    }
+    if (pool) {
+        try {
+            await Promise.any(pool.publish(RELAYS, signedEvent));
+            return;
+        } catch (e) {
+            if (!sentViaWs) throw e;
+        }
+    }
+}
+
+export async function initNostr() {
+    loadPersistedSets();
+    refreshPendingAcceptsStore();
+
+    if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
     }
 
     // 1. Manage Keys
@@ -130,70 +292,65 @@ export async function initNostr() {
 
     nostrState.update(s => ({ ...s, pubkey: pubKeyHex }));
 
-    // 2. Connect to Relays
-    pool = new SimplePool({ enablePing: true, enableReconnect: true });
-    
-    nostrState.update(s => ({ ...s, isConnected: true }));
-
-    // 3. Subscribe to the Marketplace (Offers and Accepts globally)
-    let since24h = Math.floor(Date.now() / 1000) - (24 * 60 * 60);
-    
-    subOffers = pool.subscribeMany(
-        RELAYS,
-        {
-            kinds: [13337, 13338, 13339, 13340],
-            "#t": ["hemp0x_swap", "hemp0x_swap_handshake", "hemp0x_swap_funded", "hemp0x_swap_counter_funded"],
-            since: since24h
-        },
-        {
-            onevent(event) {
-                processGlobalEvent(event);
-            }
-        }
-    );
-
-    // 4. Subscribe to Incoming Direct Messages targeting our pubkey
-    subAccepts = pool.subscribeMany(
-        RELAYS,
-        {
-            kinds: [13338, 13339, 13340, 13341],
-            "#p": [pubKeyHex],
-            since: since24h
-        },
-        {
-            onevent(event) {
-                processIncomingEvent(event);
-            }
-        }
-    );
-
-    // 5. Re-broadcast and display any active local intent offers
-    try {
-        const localSwaps = await invoke('swap_list');
-        await syncLocalIntentOffers(localSwaps);
-    } catch (e) {
-        // Ignore startup swap_list errors
+    // 2. Initialize backup pool and managed persistent WebSocket connections
+    if (!pool) {
+        pool = new SimplePool({ enablePing: false, enableReconnect: true });
     }
+
+    for (const url of RELAYS) {
+        connectRelaySocket(url);
+    }
+
+    // 3. Self-healing 6-second subscription refresh across all relays
+    pollTimer = setInterval(() => {
+        for (const url of RELAYS) {
+            const ws = relaySockets.get(url);
+            if (!ws || ws.readyState === WebSocket.CLOSED) {
+                connectRelaySocket(url);
+            } else if (ws.readyState === WebSocket.OPEN) {
+                sendRelaySubscriptions(ws);
+            }
+        }
+    }, 6000);
+
+    // 4. Wait briefly for initial relay history (so closed/accepted swaps are marked first),
+    // then sync any still-open local intent offers.
+    setTimeout(async () => {
+        initialRelaySyncDone = true;
+        try {
+            const localSwaps = await invoke('swap_list');
+            await syncLocalIntentOffers(localSwaps);
+        } catch {}
+    }, 3500);
 }
 
 export async function syncLocalIntentOffers(swaps) {
-    if (!Array.isArray(swaps) || !privKeyBytes || !pool) return;
+    if (!initialRelaySyncDone || !Array.isArray(swaps) || !privKeyBytes) return;
     const currentOffers = get(nostrState).offers;
     for (const swap of swaps) {
-        if (swap.phase === 'intent' && swap.offer_code) {
+        if (!swap?.swap_id) continue;
+        if (swap.phase !== 'intent') {
+            markSwapClosed(swap.swap_id);
+            removeLocalOffer(swap.swap_id);
+            continue;
+        }
+        if (isSwapClosed(swap.swap_id) || syncedIntentSwaps.has(swap.swap_id)) {
+            continue;
+        }
+        if (swap.offer_code) {
+            syncedIntentSwaps.add(swap.swap_id);
             const alreadyListed = currentOffers.some(o => o.rawData?.swap_id === swap.swap_id);
             if (!alreadyListed) {
                 try {
                     await publishOffer(swap.offer_code);
-                } catch (e) {
-                    // Local offer is still added by publishOffer before relay broadcast
-                }
+                } catch {}
             }
         }
     }
 }
 
 export function removeLocalOffer(swapId) {
+    if (!swapId) return;
     nostrState.update(s => ({
         ...s,
         offers: s.offers.filter(o => o.rawData?.swap_id !== swapId)
@@ -201,6 +358,7 @@ export function removeLocalOffer(swapId) {
 }
 
 function processGlobalEvent(event) {
+    if (!event?.content) return;
     if (event.kind === 13337) {
         try {
             let jsonStr = atob(event.content);
@@ -210,6 +368,7 @@ function processGlobalEvent(event) {
             if (isSwapClosed(data.swap_id)) return;
 
             nostrState.update(s => {
+                if (isSwapClosed(data.swap_id)) return s;
                 if (s.offers.find(o => o.id === event.id || o.rawData?.swap_id === data.swap_id)) return s;
 
                 let newOffer = {
@@ -228,18 +387,23 @@ function processGlobalEvent(event) {
 
                 return { ...s, offers: [...s.offers, newOffer].sort((a, b) => b.created_at - a.created_at) };
             });
-        } catch (e) {}
-    } else if (event.kind === 13339 || event.kind === 13340) {
-        // Remove an offer from the marketplace once it is funded or cancelled
+        } catch {}
+    } else if (
+        event.kind === 13338 ||
+        event.kind === 13339 ||
+        event.kind === 13340 ||
+        event.kind === 13341
+    ) {
+        // Because Nostr relays deliver events in reverse-chronological order (newest first),
+        // any handshake (13338), HTLC lock (13339/13340), cancellation, or secret reveal (13341)
+        // must immediately mark the swap closed so the older 13337 event does not re-add it.
         try {
             let data = JSON.parse(atob(event.content));
             if (data.swap_id) {
-                if (data.cancelled) {
-                    markSwapClosed(data.swap_id);
-                }
+                markSwapClosed(data.swap_id);
                 removeLocalOffer(data.swap_id);
             }
-        } catch (e) {}
+        } catch {}
     }
 }
 
@@ -255,6 +419,8 @@ async function processIncomingEvent(event) {
         if (event.kind === 13338) {
             // STEP 2: Initiator receives Acceptor's Handshake
             if (!data.swap_id || !data.want_address) return;
+            markSwapClosed(data.swap_id);
+            removeLocalOffer(data.swap_id);
             try {
                 let updatedOfferCode = await invoke('swap_lock_initiator', {
                     swapId: data.swap_id,
@@ -262,11 +428,13 @@ async function processIncomingEvent(event) {
                 });
                 await publishHTLCFunded(event.id, event.pubkey, updatedOfferCode, data.want_address, data.offer_address);
                 markEventProcessed(event.id);
-                removeLocalOffer(data.swap_id);
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
             } catch (err) {
+                const errText = String(err || "");
                 if (isWalletLockedError(err)) {
                     notifyUnlockNeeded(err, () => processIncomingEvent(event));
+                } else if (errText.includes("not in intent phase") || errText.includes("Swap not found")) {
+                    markEventProcessed(event.id);
                 } else {
                     console.warn("Failed to lock initiator funds:", err);
                 }
@@ -275,10 +443,14 @@ async function processIncomingEvent(event) {
             if (data.cancelled) {
                 markSwapClosed(data.swap_id);
                 removeLocalOffer(data.swap_id);
+                markEventProcessed(event.id);
                 return;
             }
             // STEP 3: Acceptor receives Initiator's HTLC Funded
             if (!data.offer_code || !data.swap_id) return;
+            markSwapClosed(data.swap_id);
+            removeLocalOffer(data.swap_id);
+
             const pending = getPendingAccept(data.swap_id);
             const acceptorWantAddress = pending?.wantAddress || data.acceptor_want_address || data.want_address;
             const acceptorOfferAddress = pending?.offerAddress || data.acceptor_offer_address || data.offer_address;
@@ -290,9 +462,9 @@ async function processIncomingEvent(event) {
                     wantAddress: acceptorWantAddress,
                     offerAddress: acceptorOfferAddress
                 });
+                markPendingAcceptFunded(data.swap_id);
                 await publishCounterHTLCFunded(event.id, event.pubkey, acceptCode, data.swap_id);
                 markEventProcessed(event.id);
-                removeLocalOffer(data.swap_id);
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
             } catch (err) {
                 if (isWalletLockedError(err)) {
@@ -304,6 +476,8 @@ async function processIncomingEvent(event) {
         } else if (event.kind === 13340) {
             // STEP 4: Initiator receives Acceptor's Counter-HTLC Funded
             if (!data.swap_id || !data.accept_code) return;
+            markSwapClosed(data.swap_id);
+            removeLocalOffer(data.swap_id);
             try {
                 await invoke('swap_finalize_offer', { swapId: data.swap_id, acceptCode: data.accept_code });
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
@@ -328,6 +502,9 @@ async function processIncomingEvent(event) {
         } else if (event.kind === 13341) {
             // STEP 5: Acceptor receives Initiator's Secret Reveal
             if (!data.swap_id || !data.secret) return;
+            markSwapClosed(data.swap_id);
+            removeLocalOffer(data.swap_id);
+            markPendingAcceptFunded(data.swap_id);
             try {
                 await invoke('swap_claim', { swapId: data.swap_id, providedSecret: data.secret });
                 markEventProcessed(event.id);
@@ -349,7 +526,7 @@ async function processIncomingEvent(event) {
 }
 
 export async function publishOffer(offerCodeBase64) {
-    if (!pool || !privKeyBytes) throw new Error("Nostr not initialized");
+    if (!privKeyBytes) throw new Error("Nostr not initialized");
 
     let event = {
         kind: 13337,
@@ -366,14 +543,16 @@ export async function publishOffer(offerCodeBase64) {
     processGlobalEvent(signedEvent);
     
     // Publish to all relays
-    await Promise.any(pool.publish(RELAYS, signedEvent));
+    await broadcastSignedEvent(signedEvent);
     return signedEvent.id;
 }
 
-export async function publishHandshakeAccept(offerEventId, offerPubkey, swapId, wantAddress, offerAddress) {
-    if (!pool || !privKeyBytes) throw new Error("Nostr not initialized");
+export async function publishHandshakeAccept(offerEventId, offerPubkey, swapId, wantAddress, offerAddress, offerMeta = null) {
+    if (!privKeyBytes) throw new Error("Nostr not initialized");
 
-    savePendingAccept(swapId, wantAddress, offerAddress);
+    markSwapClosed(swapId);
+    removeLocalOffer(swapId);
+    savePendingAccept(swapId, wantAddress, offerAddress, offerMeta);
 
     let payload = btoa(JSON.stringify({
         swap_id: swapId,
@@ -393,15 +572,19 @@ export async function publishHandshakeAccept(offerEventId, offerPubkey, swapId, 
     };
 
     let signedEvent = finalizeEvent(event, privKeyBytes);
-    await Promise.any(pool.publish(RELAYS, signedEvent));
+    await broadcastSignedEvent(signedEvent);
     return signedEvent.id;
 }
 
 export async function publishHTLCFunded(handshakeEventId, acceptorPubkey, updatedOfferCodeBase64, acceptorWantAddress = null, acceptorOfferAddress = null) {
-    if (!pool || !privKeyBytes) throw new Error("Nostr not initialized");
+    if (!privKeyBytes) throw new Error("Nostr not initialized");
 
     // Extract JSON from the base64 offer code to send structured data
     let offerData = JSON.parse(atob(updatedOfferCodeBase64));
+    if (offerData.swap_id) {
+        markSwapClosed(offerData.swap_id);
+        removeLocalOffer(offerData.swap_id);
+    }
     let payload = btoa(JSON.stringify({
         swap_id: offerData.swap_id,
         offer_code: updatedOfferCodeBase64,
@@ -423,12 +606,15 @@ export async function publishHTLCFunded(handshakeEventId, acceptorPubkey, update
     };
 
     let signedEvent = finalizeEvent(event, privKeyBytes);
-    await Promise.any(pool.publish(RELAYS, signedEvent));
+    await broadcastSignedEvent(signedEvent);
     return signedEvent.id;
 }
 
 export async function publishCounterHTLCFunded(htlcFundedEventId, initiatorPubkey, acceptCodeBase64, swapId) {
-    if (!pool || !privKeyBytes) throw new Error("Nostr not initialized");
+    if (!privKeyBytes) throw new Error("Nostr not initialized");
+
+    markSwapClosed(swapId);
+    removeLocalOffer(swapId);
 
     let payload = btoa(JSON.stringify({
         swap_id: swapId,
@@ -447,12 +633,15 @@ export async function publishCounterHTLCFunded(htlcFundedEventId, initiatorPubke
     };
 
     let signedEvent = finalizeEvent(event, privKeyBytes);
-    await Promise.any(pool.publish(RELAYS, signedEvent));
+    await broadcastSignedEvent(signedEvent);
     return signedEvent.id;
 }
 
 export async function publishSecretReveal(counterFundedEventId, acceptorPubkey, swapId, secret) {
-    if (!pool || !privKeyBytes) throw new Error("Nostr not initialized");
+    if (!privKeyBytes) throw new Error("Nostr not initialized");
+
+    markSwapClosed(swapId);
+    removeLocalOffer(swapId);
 
     let payload = btoa(JSON.stringify({
         swap_id: swapId,
@@ -471,7 +660,7 @@ export async function publishSecretReveal(counterFundedEventId, acceptorPubkey, 
     };
 
     let signedEvent = finalizeEvent(event, privKeyBytes);
-    await Promise.any(pool.publish(RELAYS, signedEvent));
+    await broadcastSignedEvent(signedEvent);
     return signedEvent.id;
 }
 
@@ -479,7 +668,7 @@ export async function publishOfferCancelled(swapId) {
     markSwapClosed(swapId);
     removeLocalOffer(swapId);
 
-    if (!pool || !privKeyBytes) return;
+    if (!privKeyBytes) return;
 
     try {
         let payload = btoa(JSON.stringify({
@@ -497,7 +686,7 @@ export async function publishOfferCancelled(swapId) {
         };
 
         let signedEvent = finalizeEvent(event, privKeyBytes);
-        await Promise.any(pool.publish(RELAYS, signedEvent));
+        await broadcastSignedEvent(signedEvent);
     } catch (e) {
         // relay publish best effort
     }

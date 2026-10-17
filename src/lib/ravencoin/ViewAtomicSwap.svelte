@@ -71,6 +71,11 @@
         return true;
     });
 
+    $: combinedSwaps = [
+        ...($nostrState.pendingAccepts || []).filter(p => !($activeSwaps || []).some(s => s.swap_id === p.swap_id)),
+        ...($activeSwaps || [])
+    ];
+
     // Parse acceptedCode in Accept mode so address dropdowns filter to the right chains
     $: parsedAcceptedOffer = (() => {
         if (!$swapWizardState.acceptedCode) return null;
@@ -246,7 +251,13 @@
                     $swapWizardState.publicOfferPubkey,
                     offerData.swap_id,
                     $swapWizardState.wantAddress,
-                    $swapWizardState.offerAddress
+                    $swapWizardState.offerAddress,
+                    {
+                        offer_chain: offerData.offer_chain,
+                        offer_amount: offerData.offer_amount,
+                        want_chain: offerData.want_chain,
+                        want_amount: offerData.want_amount
+                    }
                 );
                 swapWizardState.update(s => ({ ...s, step: 2 }));
             } else {
@@ -562,7 +573,7 @@
         <h2>Active Swaps</h2>
         {#if loadError}
             <p style="color: #e74c3c;">{loadError}</p>
-        {:else if $activeSwaps && $activeSwaps.length > 0}
+        {:else if combinedSwaps && combinedSwaps.length > 0}
             <table class="rvn-tx-table">
                 <thead>
                     <tr>
@@ -574,18 +585,20 @@
                     </tr>
                 </thead>
                 <tbody>
-                    {#each $activeSwaps as swap}
+                    {#each combinedSwaps as swap}
                         <tr>
                             <td>
-                                <span class="rvn-status-badge" style="text-transform: capitalize; {swap.phase === 'completed' || swap.phase === 'claimed' ? 'background: rgba(46, 204, 113, 0.1); color: #2ecc71; border-color: rgba(46, 204, 113, 0.5);' : ''} {swap.phase === 'refunded' ? 'background: rgba(231, 76, 60, 0.1); color: #e74c3c; border-color: rgba(231, 76, 60, 0.5);' : ''}">
-                                    {swap.phase}
+                                <span class="rvn-status-badge" style="text-transform: capitalize; {swap.phase === 'completed' || swap.phase === 'claimed' ? 'background: rgba(46, 204, 113, 0.1); color: #2ecc71; border-color: rgba(46, 204, 113, 0.5);' : ''} {swap.phase === 'refunded' ? 'background: rgba(231, 76, 60, 0.1); color: #e74c3c; border-color: rgba(231, 76, 60, 0.5);' : ''} {swap.phase === 'handshake' ? 'background: rgba(52, 152, 219, 0.1); color: #3498db; border-color: rgba(52, 152, 219, 0.5);' : ''}">
+                                    {swap.phase === 'handshake' ? 'negotiating' : swap.phase}
                                 </span>
                             </td>
                             <td>{swap.offer_amount} {swap.offer_asset || (swap.offer_chain === 'rvn' ? 'RVN' : 'HEMP')}</td>
                             <td>{swap.want_amount} {swap.want_asset || (swap.want_chain === 'rvn' ? 'RVN' : 'HEMP')}</td>
                             <td>{new Date(swap.created_at * 1000).toLocaleString()}</td>
                             <td style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-                                {#if swap.phase === 'created'}
+                                {#if swap.phase === 'handshake'}
+                                    <span style="font-size: 12px; color: #3498db;">Waiting for peer HTLC lock...</span>
+                                {:else if swap.phase === 'created'}
                                     <input type="text" id={`accept-code-${swap.swap_id}`} placeholder="Paste Accept Code here..." style="padding:4px; background:#111; color:#eee; border:1px solid #333; width: 150px;">
                                     <button class="rvn-button" style="padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid #3498db; color: #3498db;" on:click={() => {
                                         const code = document.getElementById(`accept-code-${swap.swap_id}`).value;

@@ -477,39 +477,85 @@ fn hemp_sendtoaddress(address: &str, amount: f64) -> Result<String, String> {
         .ok_or_else(|| "Failed to parse Hemp sendtoaddress txid".to_string())
 }
 
+fn get_raw_tx_hex(chain: &str, txid: &str) -> Option<String> {
+    if txid.trim().is_empty() {
+        return None;
+    }
+    if chain.eq_ignore_ascii_case("rvn") || chain.eq_ignore_ascii_case("ravencoin") {
+        if let Ok(res) = rvn_rpc::call_rvn_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(false)]) {
+            if let Some(hex) = res.as_str() {
+                return Some(hex.to_string());
+            }
+        }
+        if let Ok(res) = rvn_rpc::call_rvn_rpc("gettransaction", &[serde_json::Value::String(txid.to_string())]) {
+            if let Some(hex) = res.get("hex").and_then(|h| h.as_str()) {
+                return Some(hex.to_string());
+            }
+        }
+    } else {
+        if let Ok(res) = rpc::call_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(false)]) {
+            if let Some(hex) = res.as_str() {
+                return Some(hex.to_string());
+            }
+        }
+        if let Ok(res) = rpc::call_active_wallet_or_default("gettransaction", &[serde_json::Value::String(txid.to_string())]) {
+            if let Some(hex) = res.get("hex").and_then(|h| h.as_str()) {
+                return Some(hex.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn broadcast_raw_tx_best_effort(chain: &str, raw_tx: &str) {
+    if raw_tx.trim().is_empty() {
+        return;
+    }
+    if chain.eq_ignore_ascii_case("rvn") || chain.eq_ignore_ascii_case("ravencoin") {
+        let _ = rvn_rpc::call_rvn_rpc("sendrawtransaction", &[serde_json::Value::String(raw_tx.to_string())]);
+    } else {
+        let _ = rpc::call_rpc("sendrawtransaction", &[serde_json::Value::String(raw_tx.to_string())]);
+    }
+}
+
 fn rvn_find_utxo(txid: &str, address: &str) -> Result<(u32, f64, String), String> {
-    if let Ok(res) = rvn_rpc::call_rvn_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(true)]) {
-        if let Some(vouts) = res.get("vout").and_then(|v| v.as_array()) {
-            for vout in vouts {
-                let n = vout.get("n").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let value = vout.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                if let Some(spk_obj) = vout.get("scriptPubKey") {
-                    let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
-                    if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
-                        for a in addrs {
-                            if a.as_str() == Some(address) {
-                                return Ok((n, value, spk_hex));
+    for attempt in 0..6 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        }
+        if let Ok(res) = rvn_rpc::call_rvn_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(true)]) {
+            if let Some(vouts) = res.get("vout").and_then(|v| v.as_array()) {
+                for vout in vouts {
+                    let n = vout.get("n").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let value = vout.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    if let Some(spk_obj) = vout.get("scriptPubKey") {
+                        let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
+                        if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
+                            for a in addrs {
+                                if a.as_str() == Some(address) {
+                                    return Ok((n, value, spk_hex));
+                                }
                             }
                         }
                     }
                 }
             }
         }
-    }
 
-    // Fallback: check gettxout for n in 0..16 in case txindex is disabled
-    for n in 0..16u32 {
-        if let Ok(out) = rvn_rpc::call_rvn_rpc("gettxout", &[serde_json::Value::String(txid.to_string()), serde_json::json!(n), serde_json::json!(true)]) {
-            if out.is_null() {
-                continue;
-            }
-            let value = out.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            if let Some(spk_obj) = out.get("scriptPubKey") {
-                let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
-                if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
-                    for a in addrs {
-                        if a.as_str() == Some(address) {
-                            return Ok((n, value, spk_hex));
+        // Fallback: check gettxout for n in 0..16 in case txindex is disabled
+        for n in 0..16u32 {
+            if let Ok(out) = rvn_rpc::call_rvn_rpc("gettxout", &[serde_json::Value::String(txid.to_string()), serde_json::json!(n), serde_json::json!(true)]) {
+                if out.is_null() {
+                    continue;
+                }
+                let value = out.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                if let Some(spk_obj) = out.get("scriptPubKey") {
+                    let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
+                    if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
+                        for a in addrs {
+                            if a.as_str() == Some(address) {
+                                return Ok((n, value, spk_hex));
+                            }
                         }
                     }
                 }
@@ -520,38 +566,43 @@ fn rvn_find_utxo(txid: &str, address: &str) -> Result<(u32, f64, String), String
 }
 
 fn hemp_find_utxo(txid: &str, address: &str) -> Result<(u32, f64, String), String> {
-    if let Ok(res) = rpc::call_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(true)]) {
-        if let Some(vouts) = res.get("vout").and_then(|v| v.as_array()) {
-            for vout in vouts {
-                let n = vout.get("n").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let value = vout.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                if let Some(spk_obj) = vout.get("scriptPubKey") {
-                    let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
-                    if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
-                        for a in addrs {
-                            if a.as_str() == Some(address) {
-                                return Ok((n, value, spk_hex));
+    for attempt in 0..6 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        }
+        if let Ok(res) = rpc::call_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(true)]) {
+            if let Some(vouts) = res.get("vout").and_then(|v| v.as_array()) {
+                for vout in vouts {
+                    let n = vout.get("n").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let value = vout.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    if let Some(spk_obj) = vout.get("scriptPubKey") {
+                        let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
+                        if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
+                            for a in addrs {
+                                if a.as_str() == Some(address) {
+                                    return Ok((n, value, spk_hex));
+                                }
                             }
                         }
                     }
                 }
             }
         }
-    }
 
-    // Fallback: check gettxout for n in 0..16 in case txindex is disabled
-    for n in 0..16u32 {
-        if let Ok(out) = rpc::call_rpc("gettxout", &[serde_json::Value::String(txid.to_string()), serde_json::json!(n), serde_json::json!(true)]) {
-            if out.is_null() {
-                continue;
-            }
-            let value = out.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            if let Some(spk_obj) = out.get("scriptPubKey") {
-                let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
-                if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
-                    for a in addrs {
-                        if a.as_str() == Some(address) {
-                            return Ok((n, value, spk_hex));
+        // Fallback: check gettxout for n in 0..16 in case txindex is disabled
+        for n in 0..16u32 {
+            if let Ok(out) = rpc::call_rpc("gettxout", &[serde_json::Value::String(txid.to_string()), serde_json::json!(n), serde_json::json!(true)]) {
+                if out.is_null() {
+                    continue;
+                }
+                let value = out.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                if let Some(spk_obj) = out.get("scriptPubKey") {
+                    let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
+                    if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
+                        for a in addrs {
+                            if a.as_str() == Some(address) {
+                                return Ok((n, value, spk_hex));
+                            }
                         }
                     }
                 }
@@ -714,13 +765,18 @@ pub async fn swap_lock_initiator(swap_id: String, acceptor_want_address: String)
 
         record.offer.acceptor_want_address = Some(acceptor_want_address);
         record.offer.htlc_address = htlc_address;
-        record.offer.htlc_txid = htlc_txid;
+        record.offer.htlc_txid = htlc_txid.clone();
         record.offer.locktime = locktime;
         record.offer.status = "offered".to_string();
         record.phase = "offered".to_string();
         record.updated_at = now_epoch();
-        
-        let offer_json = serde_json::to_string(&record.offer).map_err(|e| e.to_string())?;
+
+        let htlc_raw_tx = get_raw_tx_hex(&record.offer.offer_chain, &htlc_txid);
+        let mut offer_val = serde_json::to_value(&record.offer).map_err(|e| e.to_string())?;
+        if let (Some(obj), Some(raw_hex)) = (offer_val.as_object_mut(), htlc_raw_tx) {
+            obj.insert("htlc_raw_tx".to_string(), serde_json::Value::String(raw_hex));
+        }
+        let offer_json = serde_json::to_string(&offer_val).map_err(|e| e.to_string())?;
         record.offer.offer_code = base64::prelude::BASE64_STANDARD.encode(offer_json.as_bytes());
 
         let res = record.offer.offer_code.clone();
@@ -876,10 +932,12 @@ pub async fn swap_accept_offer(offer_code: String, want_address: String, offer_a
         let mut store = swap_store().lock().map_err(|_| "Swap store lock poisoned")?;
         if let Some(existing) = store.get(&swap_id) {
             if let Some(acc) = &existing.acceptance {
+                let accept_htlc_raw_tx = get_raw_tx_hex(&existing.offer.want_chain, &acc.accept_htlc_txid);
                 let accept_data = serde_json::json!({
                     "swap_id": swap_id,
                     "accept_htlc_address": acc.accept_htlc_address,
                     "accept_htlc_txid": acc.accept_htlc_txid,
+                    "accept_htlc_raw_tx": accept_htlc_raw_tx,
                     "accept_offer_address": acc.acceptor_refund_address.clone().unwrap_or_else(|| acc.want_address.clone()),
                     "acceptor_want_address": acc.want_address,
                     "accept_locktime": acc.accept_locktime,
@@ -916,6 +974,9 @@ pub async fn swap_accept_offer(offer_code: String, want_address: String, offer_a
         let original_want_address = offer_data["want_address"].as_str().unwrap_or("").to_string();
         let initiator_htlc_address = offer_data["htlc_address"].as_str().unwrap_or("").to_string();
         let initiator_htlc_txid = offer_data["htlc_txid"].as_str().unwrap_or("").to_string();
+        if let Some(raw_hex) = offer_data["htlc_raw_tx"].as_str() {
+            broadcast_raw_tx_best_effort(&offer_chain, raw_hex);
+        }
 
         let now = now_epoch();
         if offer_locktime <= now {
@@ -943,6 +1004,7 @@ pub async fn swap_accept_offer(offer_code: String, want_address: String, offer_a
             let txid = rvn_sendtoaddress(&p2sh, want_amount)?;
             (p2sh, txid)
         };
+        let accept_htlc_raw_tx = get_raw_tx_hex(&want_chain, &accept_htlc_txid);
 
         let acceptance = SwapAcceptance {
             swap_id: swap_id.clone(),
@@ -992,6 +1054,7 @@ pub async fn swap_accept_offer(offer_code: String, want_address: String, offer_a
             "swap_id": swap_id,
             "accept_htlc_address": accept_htlc_address,
             "accept_htlc_txid": accept_htlc_txid,
+            "accept_htlc_raw_tx": accept_htlc_raw_tx,
             "accept_offer_address": offer_address,
             "acceptor_want_address": want_address,
             "accept_locktime": accept_locktime,
@@ -1043,6 +1106,10 @@ pub async fn swap_finalize_offer(swap_id: String, accept_code: String) -> Result
         let record = store
             .get_mut(&swap_id)
             .ok_or_else(|| format!("Swap not found: {swap_id}"))?;
+
+        if let Some(raw_hex) = accept_data["accept_htlc_raw_tx"].as_str() {
+            broadcast_raw_tx_best_effort(&record.offer.want_chain, raw_hex);
+        }
 
         if record.phase == "accepted" || record.phase == "claimed" || record.phase == "completed" {
             return Ok(format!("Swap {} already finalized", swap_id));
