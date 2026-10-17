@@ -17,8 +17,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [profile.release]
 strip = "debuginfo"
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
