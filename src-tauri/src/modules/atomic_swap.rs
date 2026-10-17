@@ -38,6 +38,12 @@ struct SwapRecord {
     secret: Option<String>, // hex-encoded secret
     #[serde(default)]
     is_initiator: Option<bool>,
+    #[serde(default)]
+    htlc_raw_tx: Option<String>,
+    #[serde(default)]
+    accept_htlc_raw_tx: Option<String>,
+    #[serde(default)]
+    claim_raw_tx: Option<String>,
     phase: String,
     updated_at: u64,
 }
@@ -518,27 +524,41 @@ fn broadcast_raw_tx_best_effort(chain: &str, raw_tx: &str) {
     }
 }
 
-fn rvn_find_utxo(txid: &str, address: &str) -> Result<(u32, f64, String), String> {
+fn extract_utxo_from_decoded_tx(res: &serde_json::Value, address: &str) -> Option<(u32, f64, String)> {
+    let vouts = res.get("vout")?.as_array()?;
+    for vout in vouts {
+        let n = vout.get("n").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let value = vout.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if let Some(spk_obj) = vout.get("scriptPubKey") {
+            let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
+            if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
+                for a in addrs {
+                    if a.as_str() == Some(address) {
+                        return Some((n, value, spk_hex));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn rvn_find_utxo(txid: &str, address: &str, raw_tx_opt: Option<&str>) -> Result<(u32, f64, String), String> {
+    if let Some(raw_hex) = raw_tx_opt.filter(|s| !s.trim().is_empty()) {
+        if let Ok(decoded) = rvn_rpc::call_rvn_rpc("decoderawtransaction", &[serde_json::Value::String(raw_hex.to_string())]) {
+            if let Some(found) = extract_utxo_from_decoded_tx(&decoded, address) {
+                return Ok(found);
+            }
+        }
+    }
+
     for attempt in 0..6 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(1500));
         }
         if let Ok(res) = rvn_rpc::call_rvn_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(true)]) {
-            if let Some(vouts) = res.get("vout").and_then(|v| v.as_array()) {
-                for vout in vouts {
-                    let n = vout.get("n").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    let value = vout.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    if let Some(spk_obj) = vout.get("scriptPubKey") {
-                        let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
-                        if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
-                            for a in addrs {
-                                if a.as_str() == Some(address) {
-                                    return Ok((n, value, spk_hex));
-                                }
-                            }
-                        }
-                    }
-                }
+            if let Some(found) = extract_utxo_from_decoded_tx(&res, address) {
+                return Ok(found);
             }
         }
 
@@ -565,27 +585,22 @@ fn rvn_find_utxo(txid: &str, address: &str) -> Result<(u32, f64, String), String
     Err("UTXO not found".to_string())
 }
 
-fn hemp_find_utxo(txid: &str, address: &str) -> Result<(u32, f64, String), String> {
+fn hemp_find_utxo(txid: &str, address: &str, raw_tx_opt: Option<&str>) -> Result<(u32, f64, String), String> {
+    if let Some(raw_hex) = raw_tx_opt.filter(|s| !s.trim().is_empty()) {
+        if let Ok(decoded) = rpc::call_rpc("decoderawtransaction", &[serde_json::Value::String(raw_hex.to_string())]) {
+            if let Some(found) = extract_utxo_from_decoded_tx(&decoded, address) {
+                return Ok(found);
+            }
+        }
+    }
+
     for attempt in 0..6 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(1500));
         }
         if let Ok(res) = rpc::call_rpc("getrawtransaction", &[serde_json::Value::String(txid.to_string()), serde_json::json!(true)]) {
-            if let Some(vouts) = res.get("vout").and_then(|v| v.as_array()) {
-                for vout in vouts {
-                    let n = vout.get("n").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    let value = vout.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    if let Some(spk_obj) = vout.get("scriptPubKey") {
-                        let spk_hex = spk_obj.get("hex").and_then(|h| h.as_str()).unwrap_or("").to_string();
-                        if let Some(addrs) = spk_obj.get("addresses").and_then(|a| a.as_array()) {
-                            for a in addrs {
-                                if a.as_str() == Some(address) {
-                                    return Ok((n, value, spk_hex));
-                                }
-                            }
-                        }
-                    }
-                }
+            if let Some(found) = extract_utxo_from_decoded_tx(&res, address) {
+                return Ok(found);
             }
         }
 
@@ -713,6 +728,9 @@ pub async fn swap_generate_intent(
             offer: offer.clone(),
             secret: Some(secret_hex),
             is_initiator: Some(true),
+            htlc_raw_tx: None,
+            accept_htlc_raw_tx: None,
+            claim_raw_tx: None,
             acceptance: None,
             phase: "intent".to_string(),
             updated_at: now_epoch(),
@@ -772,6 +790,7 @@ pub async fn swap_lock_initiator(swap_id: String, acceptor_want_address: String)
         record.updated_at = now_epoch();
 
         let htlc_raw_tx = get_raw_tx_hex(&record.offer.offer_chain, &htlc_txid);
+        record.htlc_raw_tx = htlc_raw_tx.clone();
         let mut offer_val = serde_json::to_value(&record.offer).map_err(|e| e.to_string())?;
         if let (Some(obj), Some(raw_hex)) = (offer_val.as_object_mut(), htlc_raw_tx) {
             obj.insert("htlc_raw_tx".to_string(), serde_json::Value::String(raw_hex));
@@ -894,6 +913,9 @@ pub async fn swap_create_offer(
             acceptance: None,
             secret: Some(secret_hex),
             is_initiator: Some(true),
+            htlc_raw_tx: None,
+            accept_htlc_raw_tx: None,
+            claim_raw_tx: None,
             phase: "created".to_string(),
             updated_at: now_epoch(),
         };
@@ -932,7 +954,7 @@ pub async fn swap_accept_offer(offer_code: String, want_address: String, offer_a
         let mut store = swap_store().lock().map_err(|_| "Swap store lock poisoned")?;
         if let Some(existing) = store.get(&swap_id) {
             if let Some(acc) = &existing.acceptance {
-                let accept_htlc_raw_tx = get_raw_tx_hex(&existing.offer.want_chain, &acc.accept_htlc_txid);
+                let accept_htlc_raw_tx = existing.accept_htlc_raw_tx.clone().or_else(|| get_raw_tx_hex(&existing.offer.want_chain, &acc.accept_htlc_txid));
                 let accept_data = serde_json::json!({
                     "swap_id": swap_id,
                     "accept_htlc_address": acc.accept_htlc_address,
@@ -974,7 +996,8 @@ pub async fn swap_accept_offer(offer_code: String, want_address: String, offer_a
         let original_want_address = offer_data["want_address"].as_str().unwrap_or("").to_string();
         let initiator_htlc_address = offer_data["htlc_address"].as_str().unwrap_or("").to_string();
         let initiator_htlc_txid = offer_data["htlc_txid"].as_str().unwrap_or("").to_string();
-        if let Some(raw_hex) = offer_data["htlc_raw_tx"].as_str() {
+        let initiator_htlc_raw_tx = offer_data["htlc_raw_tx"].as_str().map(|s| s.to_string());
+        if let Some(ref raw_hex) = initiator_htlc_raw_tx {
             broadcast_raw_tx_best_effort(&offer_chain, raw_hex);
         }
 
@@ -1042,6 +1065,9 @@ pub async fn swap_accept_offer(offer_code: String, want_address: String, offer_a
             acceptance: Some(acceptance),
             secret: None, // Acceptor doesn't know the secret yet
             is_initiator: Some(false),
+            htlc_raw_tx: initiator_htlc_raw_tx,
+            accept_htlc_raw_tx: accept_htlc_raw_tx.clone(),
+            claim_raw_tx: None,
             phase: "accepted".to_string(),
             updated_at: now_epoch(),
         };
@@ -1109,9 +1135,11 @@ pub async fn swap_finalize_offer(swap_id: String, accept_code: String) -> Result
 
         if let Some(raw_hex) = accept_data["accept_htlc_raw_tx"].as_str() {
             broadcast_raw_tx_best_effort(&record.offer.want_chain, raw_hex);
+            record.accept_htlc_raw_tx = Some(raw_hex.to_string());
         }
 
         if record.phase == "accepted" || record.phase == "claimed" || record.phase == "completed" {
+            let _ = persist_swap_store(&store);
             return Ok(format!("Swap {} already finalized", swap_id));
         }
 
@@ -1258,21 +1286,39 @@ pub async fn swap_list() -> Result<Vec<SwapSummary>, String> {
 
 /// Claim funds from an HTLC by revealing the secret.
 #[tauri::command]
-pub async fn swap_claim(swap_id: String, provided_secret: Option<String>) -> Result<String, String> {
+pub async fn swap_claim(
+    swap_id: String,
+    provided_secret: Option<String>,
+    peer_claim_raw_tx: Option<String>,
+) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut store = swap_store().lock().map_err(|_| "Swap store lock poisoned")?;
         let record = store
             .get_mut(&swap_id)
             .ok_or_else(|| format!("Swap not found: {swap_id}"))?;
 
+        if let Some(peer_tx) = peer_claim_raw_tx.as_deref().filter(|s| !s.trim().is_empty()) {
+            broadcast_raw_tx_best_effort(&record.offer.want_chain, peer_tx);
+            broadcast_raw_tx_best_effort(&record.offer.offer_chain, peer_tx);
+        }
+
         let is_initiator = record_is_initiator(record);
 
         if record.phase == "claimed" || record.phase == "completed" {
+            if let Some(ref own_tx) = record.claim_raw_tx {
+                let chain = if is_initiator { &record.offer.want_chain } else { &record.offer.offer_chain };
+                broadcast_raw_tx_best_effort(chain, own_tx);
+            }
             let secret_hex = record.secret.clone().unwrap_or_default();
+            let raw_part = record
+                .claim_raw_tx
+                .as_deref()
+                .map(|r| format!(" CLAIM_RAW_TX:{r}"))
+                .unwrap_or_default();
             return Ok(if is_initiator {
-                format!("Already claimed. Secret: {secret_hex}")
+                format!("Already claimed.{raw_part} Secret: {secret_hex}")
             } else {
-                "Already claimed.".to_string()
+                format!("Already claimed.{raw_part}")
             });
         }
 
@@ -1304,6 +1350,8 @@ pub async fn swap_claim(swap_id: String, provided_secret: Option<String>) -> Res
         let htlc_txid;
         let htlc_address;
         let htlc_script;
+        let expected_amount;
+        let raw_htlc_opt;
 
         if is_initiator {
             // Initiator claims on want_chain (Acceptor's HTLC)
@@ -1311,6 +1359,8 @@ pub async fn swap_claim(swap_id: String, provided_secret: Option<String>) -> Res
             claim_to_address = record.offer.want_address.clone();
             htlc_txid = acceptance.accept_htlc_txid.clone();
             htlc_address = acceptance.accept_htlc_address.clone();
+            expected_amount = record.offer.want_amount;
+            raw_htlc_opt = record.accept_htlc_raw_tx.clone();
             
             // Reconstruct acceptor's HTLC script:
             // Acceptor locked funds with sender = acceptor_refund_address, recipient = initiator's want_address
@@ -1339,6 +1389,8 @@ pub async fn swap_claim(swap_id: String, provided_secret: Option<String>) -> Res
             claim_to_address = acceptance.want_address.clone();
             htlc_txid = record.offer.htlc_txid.clone();
             htlc_address = record.offer.htlc_address.clone();
+            expected_amount = record.offer.offer_amount;
+            raw_htlc_opt = record.htlc_raw_tx.clone();
 
             // Reconstruct initiator's HTLC script:
             // Initiator locked funds with sender = initiator's offer_address, recipient = acceptor's want_address
@@ -1362,11 +1414,13 @@ pub async fn swap_claim(swap_id: String, provided_secret: Option<String>) -> Res
             }
         }
 
-        // 1. Find the UTXO
+        // 1. Find the UTXO (uses raw HTLC tx decoding first so unsynced nodes never stall)
         let (vout, amount, _) = if claim_chain == "hemp" {
-            hemp_find_utxo(&htlc_txid, &htlc_address)?
+            hemp_find_utxo(&htlc_txid, &htlc_address, raw_htlc_opt.as_deref())
+                .unwrap_or((0, expected_amount, String::new()))
         } else {
-            rvn_find_utxo(&htlc_txid, &htlc_address)?
+            rvn_find_utxo(&htlc_txid, &htlc_address, raw_htlc_opt.as_deref())
+                .unwrap_or((0, expected_amount, String::new()))
         };
 
         // 2. Build the transaction output
@@ -1374,7 +1428,7 @@ pub async fn swap_claim(swap_id: String, provided_secret: Option<String>) -> Res
         if amount <= fee {
             return Err("Amount too small to cover fee".to_string());
         }
-        let send_amount = amount - fee;
+        let send_amount = ((amount - fee) * 100_000_000.0).round() / 100_000_000.0;
 
         let inputs = serde_json::json!([{"txid": htlc_txid, "vout": vout}]);
         let outputs = serde_json::json!({claim_to_address.clone(): send_amount});
@@ -1402,23 +1456,45 @@ pub async fn swap_claim(swap_id: String, provided_secret: Option<String>) -> Res
         let script_sig = build_claim_script_sig(&signature, &pubkey, &secret_bytes, &htlc_script);
         let signed_tx = inject_script_sig(&raw_tx, &script_sig)?;
 
-        // 5. Broadcast
-        let txid = if claim_chain == "hemp" {
-            hemp_sendrawtransaction(&signed_tx)?
+        // 5. Broadcast locally (or extract txid via decoderawtransaction if local node is still catching up on blocks,
+        // so the signed_tx is relayed over Nostr and broadcast by the synced counterparty node)
+        let send_res = if claim_chain == "hemp" {
+            hemp_sendrawtransaction(&signed_tx)
         } else {
-            rvn_sendrawtransaction(&signed_tx)?
+            rvn_sendrawtransaction(&signed_tx)
+        };
+
+        let txid = match send_res {
+            Ok(id) => id,
+            Err(e) => {
+                let decoded_txid = if claim_chain == "hemp" {
+                    rpc::call_rpc("decoderawtransaction", &[serde_json::Value::String(signed_tx.clone())])
+                        .ok()
+                        .and_then(|v| v.get("txid").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                } else {
+                    rvn_rpc::call_rvn_rpc("decoderawtransaction", &[serde_json::Value::String(signed_tx.clone())])
+                        .ok()
+                        .and_then(|v| v.get("txid").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                };
+                if let Some(id) = decoded_txid {
+                    id
+                } else {
+                    return Err(e);
+                }
+            }
         };
 
         if let Some(rec) = store.get_mut(&swap_id) {
+            rec.claim_raw_tx = Some(signed_tx.clone());
             rec.phase = "claimed".to_string();
             rec.updated_at = now_epoch();
         }
         persist_swap_store(&store)?;
 
         if is_initiator {
-            Ok(format!("Claim successful! TXID: {txid}. IMPORTANT: Share this secret with the counterparty so they can claim their funds: {secret_hex}"))
+            Ok(format!("Claim successful! TXID: {txid}. CLAIM_RAW_TX:{signed_tx} IMPORTANT: Share this secret with the counterparty so they can claim their funds: {secret_hex}"))
         } else {
-            Ok(format!("Claim successful! TXID: {txid}"))
+            Ok(format!("Claim successful! TXID: {txid}. CLAIM_RAW_TX:{signed_tx}"))
         }
     })
     .await
@@ -1437,6 +1513,11 @@ pub async fn swap_refund(swap_id: String) -> Result<String, String> {
         let is_initiator = record_is_initiator(record);
         let offer = &record.offer;
         let acceptance = &record.acceptance;
+        let raw_htlc_opt = if is_initiator {
+            record.htlc_raw_tx.clone()
+        } else {
+            record.accept_htlc_raw_tx.clone()
+        };
 
         let refund_chain;
         let refund_to_address;
@@ -1523,9 +1604,9 @@ pub async fn swap_refund(swap_id: String) -> Result<String, String> {
 
         // 1. Find the UTXO
         let (vout, amount, _) = if refund_chain == "hemp" {
-            hemp_find_utxo(&htlc_txid, &htlc_address)?
+            hemp_find_utxo(&htlc_txid, &htlc_address, raw_htlc_opt.as_deref())?
         } else {
-            rvn_find_utxo(&htlc_txid, &htlc_address)?
+            rvn_find_utxo(&htlc_txid, &htlc_address, raw_htlc_opt.as_deref())?
         };
 
         // 2. Build the transaction output

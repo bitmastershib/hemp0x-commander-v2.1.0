@@ -2,7 +2,7 @@
     import { onMount } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
     import { activeSwaps, swapWizardState } from '../stores/swapStores.js';
-    import { nostrState, publishOffer, publishHandshakeAccept, syncLocalIntentOffers, removeLocalOffer, publishOfferCancelled } from '../stores/nostrStore.js';
+    import { nostrState, publishOffer, publishHandshakeAccept, syncLocalIntentOffers, removeLocalOffer, publishOfferCancelled, requestImmediateRelayPoll } from '../stores/nostrStore.js';
     import { addToastNotification } from '../stores/notifications.js';
 
     let loadError = null;
@@ -314,8 +314,10 @@
 
     async function handleClaim(swapId) {
         try {
-            const res = await invoke('swap_claim', { swapId, providedSecret: null });
-            addToastNotification(res, "success");
+            loadError = null;
+            requestImmediateRelayPoll();
+            const res = await invoke('swap_claim', { swapId, providedSecret: null, peerClaimRawTx: null });
+            addToastNotification("Swap claimed automatically!", "success");
             loadSwaps();
         } catch (e) {
             if (isWalletUnlockError(e)) {
@@ -323,20 +325,8 @@
                 return;
             }
             if (e.toString().includes("provide the secret")) {
-                const secret = prompt("Please enter the secret revealed by the counterparty:");
-                if (secret) {
-                    try {
-                        const res2 = await invoke('swap_claim', { swapId, providedSecret: secret.trim() });
-                        addToastNotification(res2, "success");
-                        loadSwaps();
-                    } catch (e2) {
-                        if (isWalletUnlockError(e2)) {
-                            requestWalletUnlock(() => handleClaim(swapId), detectUnlockChain(e2));
-                            return;
-                        }
-                        loadError = `Error claiming: ${e2}`;
-                    }
-                }
+                requestImmediateRelayPoll();
+                addToastNotification("Syncing secret from counterparty over P2P network — trade will auto-complete momentarily.", "info");
             } else {
                 loadError = `Error claiming: ${e}`;
             }
@@ -588,8 +578,8 @@
                     {#each combinedSwaps as swap}
                         <tr>
                             <td>
-                                <span class="rvn-status-badge" style="text-transform: capitalize; {swap.phase === 'completed' || swap.phase === 'claimed' ? 'background: rgba(46, 204, 113, 0.1); color: #2ecc71; border-color: rgba(46, 204, 113, 0.5);' : ''} {swap.phase === 'refunded' ? 'background: rgba(231, 76, 60, 0.1); color: #e74c3c; border-color: rgba(231, 76, 60, 0.5);' : ''} {swap.phase === 'handshake' ? 'background: rgba(52, 152, 219, 0.1); color: #3498db; border-color: rgba(52, 152, 219, 0.5);' : ''}">
-                                    {swap.phase === 'handshake' ? 'negotiating' : swap.phase}
+                                <span class="rvn-status-badge" style="text-transform: capitalize; {swap.phase === 'completed' || swap.phase === 'claimed' ? 'background: rgba(46, 204, 113, 0.1); color: #2ecc71; border-color: rgba(46, 204, 113, 0.5);' : ''} {swap.phase === 'refunded' ? 'background: rgba(231, 76, 60, 0.1); color: #e74c3c; border-color: rgba(231, 76, 60, 0.5);' : ''} {swap.phase === 'handshake' || swap.phase === 'accepted' ? 'background: rgba(52, 152, 219, 0.1); color: #3498db; border-color: rgba(52, 152, 219, 0.5);' : ''}">
+                                    {swap.phase === 'handshake' ? 'negotiating' : swap.phase === 'accepted' ? 'auto-executing' : swap.phase}
                                 </span>
                             </td>
                             <td>{swap.offer_amount} {swap.offer_asset || (swap.offer_chain === 'rvn' ? 'RVN' : 'HEMP')}</td>
@@ -606,7 +596,8 @@
                                     }}>Finalize & Lock</button>
                                     <button class="rvn-button" style="padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid #e74c3c; color: #e74c3c;" on:click={() => executeSwapAction('swap_refund', swap.swap_id)}>Refund</button>
                                 {:else if swap.phase === 'accepted'}
-                                    <button class="rvn-button" style="padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid #2ecc71; color: #2ecc71;" on:click={() => handleClaim(swap.swap_id)}>Claim</button>
+                                    <span style="font-size: 12px; color: #2ecc71;">Auto-settling via P2P...</span>
+                                    <button class="rvn-button" style="padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid #3498db; color: #3498db;" on:click={() => handleClaim(swap.swap_id)}>Sync Now</button>
                                     <button class="rvn-button" style="padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid #e74c3c; color: #e74c3c;" on:click={() => executeSwapAction('swap_refund', swap.swap_id)}>Refund</button>
                                 {:else if swap.phase === 'offered'}
                                     <button class="rvn-button" style="padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid #e74c3c; color: #e74c3c;" on:click={() => executeSwapAction('swap_refund', swap.swap_id)}>Refund</button>

@@ -292,6 +292,10 @@ fn dashboard_data_blocking() -> Result<DashboardData, String> {
         });
     }
 
+    if let Ok(rpc_data) = crate::modules::rpc::rpc_dashboard_blocking() {
+        return Ok(rpc_data);
+    }
+
     let info_raw = run_cli(&[String::from("getinfo")])?;
     let mut info: serde_json::Value = serde_json::from_str(&info_raw).map_err(|e| e.to_string())?;
     if active_vault_wallet_name().is_some() {

@@ -268,16 +268,34 @@ pub fn ensure_config() -> Result<PathBuf, String> {
        rpcport=42068\n\
        daemon={}\n\
        addnode=154.38.164.123:42069\n\
-       addnode=147.93.185.184:42069\n",
+       addnode=147.93.185.184:42069\n\
+       addnode=66.94.124.100:42069\n\
+       addnode=[2605:a143:2288:4118::1]:42069\n\
+       addnode=[2605:a140:2288:616::1]:42069\n\
+       addnode=[2605:a141:2298:3800::1]:42069\n",
             daemon_flag
         );
         fs::write(&cfg, content).map_err(|e| e.to_string())?;
     } else {
         // Ensure existing hemp.conf sets rpcport=42068 so it never defaults to 8766
-        // and collides with the Ravencoin daemon.
+        // and collides with the Ravencoin daemon, and ensure fast seed nodes are present.
         if let Ok(mut content) = fs::read_to_string(&cfg) {
+            let mut changed = false;
             if !content.lines().any(|l| l.trim().starts_with("rpcport=")) {
                 content.push_str("\nrpcport=42068\n");
+                changed = true;
+            }
+            if content.contains("154.38.164.123:42069") && !content.contains("66.94.124.100:42069") {
+                if !content.ends_with('\n') {
+                    content.push('\n');
+                }
+                content.push_str("addnode=66.94.124.100:42069\n");
+                content.push_str("addnode=[2605:a143:2288:4118::1]:42069\n");
+                content.push_str("addnode=[2605:a140:2288:616::1]:42069\n");
+                content.push_str("addnode=[2605:a141:2298:3800::1]:42069\n");
+                changed = true;
+            }
+            if changed {
                 let _ = fs::write(&cfg, content);
             }
         }
@@ -1901,6 +1919,12 @@ txindex=1
 assetindex=1
 port=42069
 rpcport=42068
+addnode=154.38.164.123:42069
+addnode=147.93.185.184:42069
+addnode=66.94.124.100:42069
+addnode=[2605:a143:2288:4118::1]:42069
+addnode=[2605:a140:2288:616::1]:42069
+addnode=[2605:a141:2298:3800::1]:42069
 "#;
 
     fs::write(&cfg, default_config).map_err(|e| e.to_string())?;
@@ -2740,6 +2764,27 @@ fn get_daemon_repair_status_blocking() -> Result<RepairStatus, String> {
         .as_ref()
         .map(|d| d.join(".lock").exists())
         .unwrap_or(false);
+
+    let has_pending = pending_mode.as_deref() == Some("reindex")
+        || pending_mode.as_deref() == Some("reindex-chainstate");
+    let has_active = active_mode.as_deref() == Some("reindex")
+        || active_mode.as_deref() == Some("reindex-chainstate");
+
+    if !has_pending && !has_active {
+        return Ok(RepairStatus {
+            active: false,
+            mode: None,
+            phase: "Idle".to_string(),
+            rpc_online: lock_exists,
+            lock_exists,
+            blocks: None,
+            headers: None,
+            verification_progress: None,
+            latest_log_line: None,
+            log_hint: None,
+        });
+    }
+
     let debug_log_path = dir.as_ref().map(|d| d.join("debug.log"));
 
     let blockchain_info = crate::modules::rpc::rpc_context()
@@ -2761,11 +2806,6 @@ fn get_daemon_repair_status_blocking() -> Result<RepairStatus, String> {
         .unwrap_or_default();
     let log_hint = parse_log_hint(&log_lines);
     let latest_log_line = log_lines.last().cloned();
-
-    let has_pending = pending_mode.as_deref() == Some("reindex")
-        || pending_mode.as_deref() == Some("reindex-chainstate");
-    let has_active = active_mode.as_deref() == Some("reindex")
-        || active_mode.as_deref() == Some("reindex-chainstate");
     let shutdown_seen = latest_log_line
         .as_ref()
         .map(|line| {

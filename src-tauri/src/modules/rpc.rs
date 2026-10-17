@@ -700,15 +700,112 @@ pub async fn rpc_dashboard() -> Result<DashboardData, String> {
         .map_err(|e| format!("Dashboard RPC task failed: {e}"))?
 }
 
-fn rpc_dashboard_blocking() -> Result<DashboardData, String> {
+static SYNC_DASHBOARD_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::time::Instant, serde_json::Value, serde_json::Value)>>,
+> = std::sync::OnceLock::new();
+
+static LAST_PEER_CHECK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn boost_and_heal_sync_peers(ctx: &RpcContext) {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let prev = LAST_PEER_CHECK.load(std::sync::atomic::Ordering::Relaxed);
+    if now_secs.saturating_sub(prev) < 20 {
+        return;
+    }
+    LAST_PEER_CHECK.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+
+    let short_connect = Duration::from_millis(500);
+    let short_read = Duration::from_millis(2000);
+
+    let Ok(peers_val) = ctx.call_with_timeouts("getpeerinfo", &[], short_connect, short_read) else {
+        return;
+    };
+    let Some(peers) = peers_val.as_array() else {
+        return;
+    };
+
+    if peers.len() < 4 {
+        for seed in [
+            "66.94.124.100:42069",
+            "154.38.164.123:42069",
+            "[2605:a143:2288:4118::1]:42069",
+            "[2605:a140:2288:616::1]:42069",
+        ] {
+            let _ = ctx.call_with_timeouts(
+                "addnode",
+                &[
+                    serde_json::Value::String(seed.to_string()),
+                    serde_json::Value::String("onetry".to_string()),
+                ],
+                short_connect,
+                short_read,
+            );
+        }
+    }
+
+    if peers.len() >= 2 {
+        let has_healthy_peer = peers.iter().any(|p| {
+            p.get("pingwait").and_then(|v| v.as_f64()).unwrap_or(0.0) < 2.0
+                && p.get("synced_headers").and_then(|v| v.as_i64()).unwrap_or(-1) > 0
+        });
+        if has_healthy_peer {
+            for p in peers {
+                let inflight_len = p
+                    .get("inflight")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let pingwait = p.get("pingwait").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                if inflight_len > 0 && pingwait > 15.0 {
+                    if let Some(addr) = p.get("addr").and_then(|v| v.as_str()) {
+                        let _ = ctx.call_with_timeouts(
+                            "disconnectnode",
+                            &[serde_json::Value::String(addr.to_string())],
+                            short_connect,
+                            short_read,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn rpc_dashboard_blocking() -> Result<DashboardData, String> {
     let _cfg = ensure_config()?;
     let ctx = rpc_context()?;
 
-    let fast_connect = Duration::from_millis(800);
-    let fast_read = Duration::from_millis(2500);
+    let fast_connect = Duration::from_millis(1000);
+    let fast_read = Duration::from_millis(8000);
+
+    let bc = ctx.call_with_timeouts("getblockchaininfo", &[], fast_connect, fast_read)?;
+    let b = bc["blocks"].as_u64().unwrap_or(0);
+    let h = bc["headers"].as_u64().unwrap_or(0);
+    let is_syncing = h > b + 10;
+
+    if is_syncing {
+        boost_and_heal_sync_peers(&ctx);
+        let cache_mutex = SYNC_DASHBOARD_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+        if let Ok(guard) = cache_mutex.lock() {
+            if let Some((ts, ref cached_info, ref cached_tx)) = *guard {
+                if ts.elapsed() < Duration::from_secs(18) {
+                    let mut info = cached_info.clone();
+                    if let Some(obj) = info.as_object_mut() {
+                        obj.insert("blocks".to_string(), serde_json::json!(b));
+                        if let Some(diff) = bc.get("difficulty") {
+                            obj.insert("difficulty".to_string(), diff.clone());
+                        }
+                    }
+                    return build_dashboard_from_rpc(&info, &bc, cached_tx);
+                }
+            }
+        }
+    }
 
     let mut info = ctx.call_with_timeouts("getinfo", &[], fast_connect, fast_read)?;
-    let bc = ctx.call_with_timeouts("getblockchaininfo", &[], fast_connect, fast_read)?;
     let tx_params = [
         serde_json::Value::String("*".to_string()),
         serde_json::Value::Number(serde_json::value::Number::from(100)),
@@ -730,11 +827,20 @@ fn rpc_dashboard_blocking() -> Result<DashboardData, String> {
             fast_read,
         )?
     } else {
-        if let Ok(wallet_info) = ctx.call_with_timeouts("getwalletinfo", &[], fast_connect, fast_read) {
+        if let Ok(wallet_info) =
+            ctx.call_with_timeouts("getwalletinfo", &[], fast_connect, fast_read)
+        {
             overlay_wallet_info(&mut info, &wallet_info);
         }
         ctx.call_with_timeouts("listtransactions", &tx_params, fast_connect, fast_read)?
     };
+
+    if is_syncing {
+        let cache_mutex = SYNC_DASHBOARD_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+        if let Ok(mut guard) = cache_mutex.lock() {
+            *guard = Some((std::time::Instant::now(), info.clone(), tx_raw.clone()));
+        }
+    }
 
     build_dashboard_from_rpc(&info, &bc, &tx_raw)
 }

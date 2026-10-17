@@ -481,12 +481,23 @@ async function processIncomingEvent(event) {
             try {
                 await invoke('swap_finalize_offer', { swapId: data.swap_id, acceptCode: data.accept_code });
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
-                let claimRes = await invoke('swap_claim', { swapId: data.swap_id, providedSecret: null });
+                let claimRes = await invoke('swap_claim', {
+                    swapId: data.swap_id,
+                    providedSecret: null,
+                    peerClaimRawTx: null
+                });
                 
-                // Extract secret from claimRes string
+                // Extract secret and signed claim raw tx from claimRes string
                 let secretMatch = claimRes.match(/([a-f0-9]{64})$/i);
+                let rawTxMatch = claimRes.match(/CLAIM_RAW_TX:([a-f0-9]+)/i);
                 if (secretMatch && secretMatch[1]) {
-                    await publishSecretReveal(event.id, event.pubkey, data.swap_id, secretMatch[1]);
+                    await publishSecretReveal(
+                        event.id,
+                        event.pubkey,
+                        data.swap_id,
+                        secretMatch[1],
+                        rawTxMatch ? rawTxMatch[1] : null
+                    );
                 }
 
                 markEventProcessed(event.id);
@@ -500,13 +511,24 @@ async function processIncomingEvent(event) {
                 }
             }
         } else if (event.kind === 13341) {
-            // STEP 5: Acceptor receives Initiator's Secret Reveal
-            if (!data.swap_id || !data.secret) return;
+            // STEP 5: Acceptor receives Initiator's Secret Reveal (or Initiator receives Acceptor's claim_raw_tx relay)
+            if (!data.swap_id) return;
             markSwapClosed(data.swap_id);
             removeLocalOffer(data.swap_id);
             markPendingAcceptFunded(data.swap_id);
             try {
-                await invoke('swap_claim', { swapId: data.swap_id, providedSecret: data.secret });
+                let claimRes = await invoke('swap_claim', {
+                    swapId: data.swap_id,
+                    providedSecret: data.secret || null,
+                    peerClaimRawTx: data.claim_raw_tx || null
+                });
+                // If Acceptor signed a claim tx and hasn't echoed it yet, relay claim_raw_tx back so Initiator's synced node broadcasts it too
+                if (!data.acceptor_echo) {
+                    let rawTxMatch = String(claimRes || "").match(/CLAIM_RAW_TX:([a-f0-9]+)/i);
+                    if (rawTxMatch && rawTxMatch[1]) {
+                        await publishAcceptorClaimEcho(event.id, event.pubkey, data.swap_id, rawTxMatch[1]);
+                    }
+                }
                 markEventProcessed(event.id);
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_autoclaimed', { detail: { swap_id: data.swap_id } }));
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
@@ -522,6 +544,17 @@ async function processIncomingEvent(event) {
         // Invalid content
     } finally {
         inFlightEvents.delete(event.id);
+    }
+}
+
+export function requestImmediateRelayPoll() {
+    for (const url of RELAYS) {
+        const ws = relaySockets.get(url);
+        if (!ws || ws.readyState === WebSocket.CLOSED) {
+            connectRelaySocket(url);
+        } else if (ws.readyState === WebSocket.OPEN) {
+            sendRelaySubscriptions(ws);
+        }
     }
 }
 
@@ -637,7 +670,7 @@ export async function publishCounterHTLCFunded(htlcFundedEventId, initiatorPubke
     return signedEvent.id;
 }
 
-export async function publishSecretReveal(counterFundedEventId, acceptorPubkey, swapId, secret) {
+export async function publishSecretReveal(counterFundedEventId, acceptorPubkey, swapId, secret, claimRawTx = null) {
     if (!privKeyBytes) throw new Error("Nostr not initialized");
 
     markSwapClosed(swapId);
@@ -645,7 +678,8 @@ export async function publishSecretReveal(counterFundedEventId, acceptorPubkey, 
 
     let payload = btoa(JSON.stringify({
         swap_id: swapId,
-        secret: secret
+        secret: secret,
+        claim_raw_tx: claimRawTx || undefined
     }));
 
     let event = {
@@ -662,6 +696,29 @@ export async function publishSecretReveal(counterFundedEventId, acceptorPubkey, 
     let signedEvent = finalizeEvent(event, privKeyBytes);
     await broadcastSignedEvent(signedEvent);
     return signedEvent.id;
+}
+
+async function publishAcceptorClaimEcho(secretEventId, initiatorPubkey, swapId, claimRawTx) {
+    if (!privKeyBytes || !claimRawTx) return;
+    try {
+        let payload = btoa(JSON.stringify({
+            swap_id: swapId,
+            claim_raw_tx: claimRawTx,
+            acceptor_echo: true
+        }));
+        let event = {
+            kind: 13341,
+            created_at: Math.floor(Date.now() / 1000),
+            tags: [
+                ["t", "hemp0x_swap_secret"],
+                ["e", secretEventId],
+                ["p", initiatorPubkey]
+            ],
+            content: payload
+        };
+        let signedEvent = finalizeEvent(event, privKeyBytes);
+        await broadcastSignedEvent(signedEvent);
+    } catch {}
 }
 
 export async function publishOfferCancelled(swapId) {

@@ -518,7 +518,13 @@ fn start_node_inner(wallet_name: Option<&str>) -> Result<(), String> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         cmd.arg(format!("-conf={}", cfg.to_string_lossy()))
-            .arg(format!("-datadir={}", dir.to_string_lossy()));
+            .arg(format!("-datadir={}", dir.to_string_lossy()))
+            .arg("-dbcache=2048")
+            .arg("-par=0")
+            .arg("-maxconnections=64")
+            .arg("-rpcthreads=16")
+            .arg("-rpcworkqueue=64")
+            .arg("-maxsigcachesize=64");
         if !is_regtest && !is_testnet {
             cmd.arg(format!("-rpcport={}", rpc_port));
         }
@@ -533,7 +539,13 @@ fn start_node_inner(wallet_name: Option<&str>) -> Result<(), String> {
     #[cfg(unix)]
     {
         cmd.arg(format!("-conf={}", cfg.to_string_lossy()))
-            .arg(format!("-datadir={}", dir.to_string_lossy()));
+            .arg(format!("-datadir={}", dir.to_string_lossy()))
+            .arg("-dbcache=2048")
+            .arg("-par=0")
+            .arg("-maxconnections=64")
+            .arg("-rpcthreads=16")
+            .arg("-rpcworkqueue=64")
+            .arg("-maxsigcachesize=64");
         if !is_regtest && !is_testnet {
             cmd.arg(format!("-rpcport={}", rpc_port));
         }

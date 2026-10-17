@@ -174,7 +174,13 @@ fn rvn_start_node_blocking() -> Result<String, String> {
 
     cmd.arg(format!("-conf={}", config_path.to_string_lossy()))
         .arg(format!("-datadir={}", data_dir.to_string_lossy()))
-        .arg("-rpcport=8766");
+        .arg("-rpcport=8766")
+        .arg("-dbcache=2048")
+        .arg("-par=0")
+        .arg("-maxconnections=64")
+        .arg("-rpcthreads=16")
+        .arg("-rpcworkqueue=64")
+        .arg("-maxsigcachesize=64");
 
     #[cfg(unix)]
     {
