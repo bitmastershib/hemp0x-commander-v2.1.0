@@ -752,9 +752,25 @@ pub(crate) fn ensure_p2p_sync_relays_started() {
                 let b = bc["blocks"].as_u64().unwrap_or(0);
                 let h = bc["headers"].as_u64().unwrap_or(0);
                 let should_suppress = h > 4_000_000 && h > b + 500;
-                SUPPRESS_TIP_HEADERS.store(should_suppress, std::sync::atomic::Ordering::Relaxed);
+                let was_suppressing = SUPPRESS_TIP_HEADERS
+                    .swap(should_suppress, std::sync::atomic::Ordering::Relaxed);
 
                 if !should_suppress {
+                    if was_suppressing {
+                        // Just finished catching up within 500 blocks of tip: re-add direct seeds
+                        // so any blocks mined during the final stretch of sync arrive immediately.
+                        for &(_, seed) in P2P_RELAY_TARGETS {
+                            let _ = ctx.call_with_timeouts(
+                                "addnode",
+                                &[
+                                    serde_json::Value::String(seed.to_string()),
+                                    serde_json::Value::String("onetry".to_string()),
+                                ],
+                                short_connect,
+                                short_read,
+                            );
+                        }
+                    }
                     std::thread::sleep(Duration::from_secs(5));
                     continue;
                 }
@@ -852,12 +868,16 @@ fn handle_p2p_relay_conn(mut local: std::net::TcpStream, remote_target: &str) {
     // Upstream pump: hemp0xd -> remote peer
     std::thread::spawn(move || {
         let _ = std::io::copy(&mut local_reader, &mut remote_writer);
+        let _ = local_reader.shutdown(std::net::Shutdown::Both);
+        let _ = remote_writer.shutdown(std::net::Shutdown::Both);
     });
 
-    // Downstream pump: remote peer -> hemp0xd (suppresses unsolicited tip headers/inv
-    // once block streaming has started on this connection so hemp0xd's single-slot
-    // KawPoW Epoch DAG cache is not evicted every 5 seconds by newly mined tip blocks).
+    // Downstream pump: remote peer -> hemp0xd
+    // Always allows the initial handshake headers and any bulk header sync batches (>1024 bytes),
+    // while holding back unsolicited 1-block tip announcements (headers <= 1024B, inv, cmpctblock)
+    // during cross-epoch block catchup so hemp0xd's 1-slot KawPoW Epoch DAG cache never thrashes.
     let mut hdr = [0u8; 24];
+    let mut seen_initial_headers = false;
     let mut seen_block = false;
     loop {
         if remote.read_exact(&mut hdr).is_err() {
@@ -880,9 +900,16 @@ fn handle_p2p_relay_conn(mut local: std::net::TcpStream, remote_target: &str) {
             seen_block = true;
         }
 
-        if seen_block
-            && SUPPRESS_TIP_HEADERS.load(std::sync::atomic::Ordering::Relaxed)
-            && matches!(cmd, "headers" | "inv" | "cmpctblock")
+        let suppressing = SUPPRESS_TIP_HEADERS.load(std::sync::atomic::Ordering::Relaxed);
+        if cmd == "headers" {
+            if !seen_initial_headers || payload_len > 1024 {
+                seen_initial_headers = true;
+            } else if suppressing {
+                continue;
+            }
+        } else if matches!(cmd, "inv" | "cmpctblock")
+            && suppressing
+            && (seen_initial_headers || seen_block)
         {
             continue;
         }
@@ -894,16 +921,18 @@ fn handle_p2p_relay_conn(mut local: std::net::TcpStream, remote_target: &str) {
             break;
         }
     }
+    let _ = local.shutdown(std::net::Shutdown::Both);
+    let _ = remote.shutdown(std::net::Shutdown::Both);
 }
 
 fn boost_and_heal_sync_peers(ctx: &RpcContext, blocks: u64, headers: u64) {
-    // Enable P2P tip-header hold when headers are synced ahead by >500 blocks (cross-epoch catchup)
+    ensure_p2p_sync_relays_started();
     let should_suppress = headers > 4_000_000 && headers > blocks + 500;
-    let was_suppressing =
-        SUPPRESS_TIP_HEADERS.swap(should_suppress, std::sync::atomic::Ordering::Relaxed);
+    SUPPRESS_TIP_HEADERS.store(should_suppress, std::sync::atomic::Ordering::Relaxed);
 
     if should_suppress {
-        ensure_p2p_sync_relays_started();
+        // Dedicated 1.5s background guardian thread manages relay peers while suppressing
+        return;
     }
 
     let now_secs = std::time::SystemTime::now()
@@ -911,8 +940,7 @@ fn boost_and_heal_sync_peers(ctx: &RpcContext, blocks: u64, headers: u64) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let prev = LAST_PEER_CHECK.load(std::sync::atomic::Ordering::Relaxed);
-    let min_interval = if should_suppress { 4 } else { 20 };
-    if now_secs.saturating_sub(prev) < min_interval && was_suppressing == should_suppress {
+    if now_secs.saturating_sub(prev) < 20 {
         return;
     }
     LAST_PEER_CHECK.store(now_secs, std::sync::atomic::Ordering::Relaxed);
@@ -927,48 +955,7 @@ fn boost_and_heal_sync_peers(ctx: &RpcContext, blocks: u64, headers: u64) {
         return;
     };
 
-    if should_suppress {
-        let relay_count = peers
-            .iter()
-            .filter(|p| {
-                p.get("addr")
-                    .and_then(|v| v.as_str())
-                    .map(|a| a.starts_with("127.0.0.1:"))
-                    .unwrap_or(false)
-            })
-            .count();
-
-        if relay_count < 4 {
-            for &(port, _) in P2P_RELAY_TARGETS {
-                let _ = ctx.call_with_timeouts(
-                    "addnode",
-                    &[
-                        serde_json::Value::String(format!("127.0.0.1:{port}")),
-                        serde_json::Value::String("onetry".to_string()),
-                    ],
-                    short_connect,
-                    short_read,
-                );
-            }
-        }
-
-        // Disconnect direct remote peers so all block downloads flow through the
-        // local P2P sync accelerator without tip-epoch KawPoW DAG cache eviction.
-        if relay_count >= 1 {
-            for p in peers {
-                if let Some(addr) = p.get("addr").and_then(|v| v.as_str()) {
-                    if !addr.starts_with("127.0.0.1:") {
-                        let _ = ctx.call_with_timeouts(
-                            "disconnectnode",
-                            &[serde_json::Value::String(addr.to_string())],
-                            short_connect,
-                            short_read,
-                        );
-                    }
-                }
-            }
-        }
-    } else if peers.len() < 4 {
+    if peers.len() < 4 {
         for seed in [
             "66.94.124.100:42069",
             "154.38.164.123:42069",
@@ -1034,7 +1021,7 @@ pub(crate) fn rpc_dashboard_blocking() -> Result<DashboardData, String> {
         let cache_mutex = SYNC_DASHBOARD_CACHE.get_or_init(|| std::sync::Mutex::new(None));
         if let Ok(guard) = cache_mutex.lock() {
             if let Some((ts, ref cached_info, ref cached_tx)) = *guard {
-                if ts.elapsed() < Duration::from_secs(18) {
+                if ts.elapsed() < Duration::from_secs(8) {
                     let mut info = cached_info.clone();
                     if let Some(obj) = info.as_object_mut() {
                         obj.insert("blocks".to_string(), serde_json::json!(b));

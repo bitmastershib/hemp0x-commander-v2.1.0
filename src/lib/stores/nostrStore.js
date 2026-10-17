@@ -40,6 +40,10 @@ const inFlightEvents = new Set();
 const closedSwapsMem = new Set();
 const processedEventsMem = new Set();
 const syncedIntentSwaps = new Set();
+const reconciledClaimSwaps = new Set();
+const lastCounterBroadcastAt = new Map();
+let isReconcilingSwaps = false;
+let pollTicks = 0;
 
 function loadPersistedSets() {
     try {
@@ -224,9 +228,7 @@ function connectRelaySocket(url) {
                     if (
                         event.kind >= 13338 &&
                         event.kind <= 13341 &&
-                        event.pubkey !== pubKeyHex &&
-                        Array.isArray(event.tags) &&
-                        event.tags.some(t => t[0] === "p" && t[1] === pubKeyHex)
+                        event.pubkey !== pubKeyHex
                     ) {
                         processIncomingEvent(event);
                     }
@@ -301,8 +303,9 @@ export async function initNostr() {
         connectRelaySocket(url);
     }
 
-    // 3. Self-healing 6-second subscription refresh across all relays
-    pollTimer = setInterval(() => {
+    // 3. Self-healing 6-second subscription refresh across all relays + 12-second active swap reconciliation
+    pollTimer = setInterval(async () => {
+        pollTicks++;
         for (const url of RELAYS) {
             const ws = relaySockets.get(url);
             if (!ws || ws.readyState === WebSocket.CLOSED) {
@@ -311,10 +314,16 @@ export async function initNostr() {
                 sendRelaySubscriptions(ws);
             }
         }
+        if (initialRelaySyncDone && pollTicks % 2 === 0) {
+            try {
+                const localSwaps = await invoke('swap_list');
+                await reconcileActiveSwaps(localSwaps);
+            } catch {}
+        }
     }, 6000);
 
     // 4. Wait briefly for initial relay history (so closed/accepted swaps are marked first),
-    // then sync any still-open local intent offers.
+    // then sync any still-open local intent offers and reconcile active swaps.
     setTimeout(async () => {
         initialRelaySyncDone = true;
         try {
@@ -322,6 +331,82 @@ export async function initNostr() {
             await syncLocalIntentOffers(localSwaps);
         } catch {}
     }, 3500);
+}
+
+export async function reconcileActiveSwaps(swaps) {
+    if (!initialRelaySyncDone || !Array.isArray(swaps) || !privKeyBytes || isReconcilingSwaps) return;
+    isReconcilingSwaps = true;
+    try {
+        const nowMs = Date.now();
+        for (const swap of swaps) {
+            if (!swap?.swap_id) continue;
+
+            if (swap.is_initiator) {
+                if (swap.phase === 'accepted') {
+                    // Initiator finalized counter-HTLC but hasn't claimed/revealed secret yet
+                    try {
+                        const claimRes = await invoke('swap_claim', {
+                            swapId: swap.swap_id,
+                            providedSecret: null,
+                            peerClaimRawTx: null
+                        });
+                        const secretMatch = String(claimRes || "").match(/([a-f0-9]{64})$/i);
+                        const rawTxMatch = String(claimRes || "").match(/CLAIM_RAW_TX:([a-f0-9]+)/i);
+                        const secret = (secretMatch && secretMatch[1]) || swap.secret;
+                        const claimRawTx = (rawTxMatch && rawTxMatch[1]) || swap.claim_raw_tx || null;
+                        if (secret) {
+                            await publishSecretReveal("", "", swap.swap_id, secret, claimRawTx);
+                            reconciledClaimSwaps.add(swap.swap_id);
+                        }
+                        window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
+                    } catch {}
+                } else if ((swap.phase === 'claimed' || swap.phase === 'completed') && swap.secret && !reconciledClaimSwaps.has(swap.swap_id)) {
+                    // Re-broadcast secret + claim_raw_tx once per session so any Acceptor waiting in 'accepted' receives it immediately
+                    reconciledClaimSwaps.add(swap.swap_id);
+                    let claimRawTx = swap.claim_raw_tx || null;
+                    try {
+                        const claimRes = await invoke('swap_claim', {
+                            swapId: swap.swap_id,
+                            providedSecret: null,
+                            peerClaimRawTx: null
+                        });
+                        const rawTxMatch = String(claimRes || "").match(/CLAIM_RAW_TX:([a-f0-9]+)/i);
+                        if (rawTxMatch && rawTxMatch[1]) claimRawTx = rawTxMatch[1];
+                    } catch {}
+                    try {
+                        await publishSecretReveal("", "", swap.swap_id, swap.secret, claimRawTx);
+                    } catch {}
+                }
+            } else {
+                // Acceptor in 'accepted' phase waiting for Initiator's secret reveal
+                if (swap.phase === 'accepted') {
+                    const lastSent = lastCounterBroadcastAt.get(swap.swap_id) || 0;
+                    if (swap.accept_code && nowMs - lastSent > 25000) {
+                        lastCounterBroadcastAt.set(swap.swap_id, nowMs);
+                        try {
+                            await publishCounterHTLCFunded("", "", swap.accept_code, swap.swap_id);
+                        } catch {}
+                    }
+                    // Also attempt auto-claim (checks mempool on want_chain for revealed preimage!)
+                    try {
+                        const claimRes = await invoke('swap_claim', {
+                            swapId: swap.swap_id,
+                            providedSecret: null,
+                            peerClaimRawTx: null
+                        });
+                        const rawTxMatch = String(claimRes || "").match(/CLAIM_RAW_TX:([a-f0-9]+)/i);
+                        if (rawTxMatch && rawTxMatch[1]) {
+                            await publishAcceptorClaimEcho("", "", swap.swap_id, rawTxMatch[1]);
+                        }
+                        window.dispatchEvent(new CustomEvent('hemp0x_swap_autoclaimed', { detail: { swap_id: swap.swap_id } }));
+                        window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
+                    } catch {}
+                }
+            }
+        }
+    } finally {
+        isReconcilingSwaps = false;
+    }
 }
 
 export async function syncLocalIntentOffers(swaps) {
@@ -347,6 +432,7 @@ export async function syncLocalIntentOffers(swaps) {
             }
         }
     }
+    await reconcileActiveSwaps(swaps);
 }
 
 export function removeLocalOffer(swapId) {
@@ -452,6 +538,9 @@ async function processIncomingEvent(event) {
             removeLocalOffer(data.swap_id);
 
             const pending = getPendingAccept(data.swap_id);
+            const isTargetedToMe = Array.isArray(event.tags) && event.tags.some(t => t[0] === "p" && t[1] === pubKeyHex);
+            if (!pending && !isTargetedToMe) return;
+
             const acceptorWantAddress = pending?.wantAddress || data.acceptor_want_address || data.want_address;
             const acceptorOfferAddress = pending?.offerAddress || data.acceptor_offer_address || data.offer_address;
             if (!acceptorWantAddress || !acceptorOfferAddress) return;
@@ -479,7 +568,18 @@ async function processIncomingEvent(event) {
             markSwapClosed(data.swap_id);
             removeLocalOffer(data.swap_id);
             try {
-                await invoke('swap_finalize_offer', { swapId: data.swap_id, acceptCode: data.accept_code });
+                try {
+                    await invoke('swap_finalize_offer', { swapId: data.swap_id, acceptCode: data.accept_code });
+                } catch (finErr) {
+                    const finText = String(finErr || "");
+                    if (finText.includes("Swap not found")) {
+                        markEventProcessed(event.id);
+                        return;
+                    }
+                    if (!finText.includes("Swap must be in created phase")) {
+                        throw finErr;
+                    }
+                }
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
                 let claimRes = await invoke('swap_claim', {
                     swapId: data.swap_id,
@@ -504,8 +604,11 @@ async function processIncomingEvent(event) {
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_autoclaimed', { detail: { swap_id: data.swap_id } }));
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
             } catch (err) {
+                const errText = String(err || "");
                 if (isWalletLockedError(err)) {
                     notifyUnlockNeeded(err, () => processIncomingEvent(event));
+                } else if (errText.includes("Swap not found")) {
+                    markEventProcessed(event.id);
                 } else {
                     console.warn("Failed to finalize and claim:", err);
                 }
@@ -533,8 +636,11 @@ async function processIncomingEvent(event) {
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_autoclaimed', { detail: { swap_id: data.swap_id } }));
                 window.dispatchEvent(new CustomEvent('hemp0x_swap_updated'));
             } catch (err) {
+                const errText = String(err || "");
                 if (isWalletLockedError(err)) {
                     notifyUnlockNeeded(err, () => processIncomingEvent(event));
+                } else if (errText.includes("Swap not found") || errText.includes("Swap must be in accepted phase")) {
+                    markEventProcessed(event.id);
                 } else {
                     console.warn("Failed to execute acceptor claim:", err);
                 }

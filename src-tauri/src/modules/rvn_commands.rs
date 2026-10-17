@@ -181,7 +181,9 @@ pub async fn rvn_send_rvn(
             let target_sats = (amount * 100_000_000.0).round() as i64;
 
             for u in utxos {
-                if u.get("spendable").and_then(|v| v.as_bool()) == Some(false) {
+                if u.get("spendable").and_then(|v| v.as_bool()) == Some(false)
+                    || u.get("assetName").is_some()
+                {
                     continue;
                 }
                 let u_amt = u.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -336,7 +338,10 @@ pub async fn rvn_preview_send(
             .and_then(|v| v.as_array().cloned())
             .map(|arr| {
                 arr.iter()
-                    .filter(|u| u.get("spendable").and_then(|v| v.as_bool()) != Some(false))
+                    .filter(|u| {
+                        u.get("spendable").and_then(|v| v.as_bool()) != Some(false)
+                            && u.get("assetName").is_none()
+                    })
                     .filter_map(|u| u.get("amount").and_then(|v| v.as_f64()))
                     .sum::<f64>()
             })

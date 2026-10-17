@@ -866,6 +866,7 @@ pub async fn swap_create_offer(
 
         // Generate swap ID
         let swap_id = uuid::Uuid::new_v4().to_string();
+        let htlc_raw_tx = get_raw_tx_hex(&offer_chain_lower, &htlc_txid);
 
         // Build the offer code (base64-encoded JSON for sharing)
         let offer_data = serde_json::json!({
@@ -881,6 +882,7 @@ pub async fn swap_create_offer(
             "want_address": want_address,
             "htlc_address": htlc_address,
             "htlc_txid": htlc_txid,
+            "htlc_raw_tx": htlc_raw_tx,
             "locktime": locktime,
             "version": 1,
         });
@@ -913,7 +915,7 @@ pub async fn swap_create_offer(
             acceptance: None,
             secret: Some(secret_hex),
             is_initiator: Some(true),
-            htlc_raw_tx: None,
+            htlc_raw_tx,
             accept_htlc_raw_tx: None,
             claim_raw_tx: None,
             phase: "created".to_string(),
@@ -1190,9 +1192,11 @@ fn is_htlc_tx_confirmed(chain: &str, txid: &str) -> bool {
                 if confs > 0 { return true; }
             }
         }
-        if let Ok(res) = rvn_rpc::call_rvn_rpc("gettxout", &[serde_json::Value::String(txid.to_string()), serde_json::json!(0), serde_json::json!(true)]) {
-            if let Some(confs) = res.get("confirmations").and_then(|c| c.as_i64()) {
-                if confs > 0 { return true; }
+        for vout in 0..4u32 {
+            if let Ok(res) = rvn_rpc::call_rvn_rpc("gettxout", &[serde_json::Value::String(txid.to_string()), serde_json::json!(vout), serde_json::json!(true)]) {
+                if let Some(confs) = res.get("confirmations").and_then(|c| c.as_i64()) {
+                    if confs > 0 { return true; }
+                }
             }
         }
     } else {
@@ -1201,71 +1205,101 @@ fn is_htlc_tx_confirmed(chain: &str, txid: &str) -> bool {
                 if confs > 0 { return true; }
             }
         }
-        if let Ok(res) = rpc::call_rpc("gettxout", &[serde_json::Value::String(txid.to_string()), serde_json::json!(0), serde_json::json!(true)]) {
-            if let Some(confs) = res.get("confirmations").and_then(|c| c.as_i64()) {
-                if confs > 0 { return true; }
+        for vout in 0..4u32 {
+            if let Ok(res) = rpc::call_rpc("gettxout", &[serde_json::Value::String(txid.to_string()), serde_json::json!(vout), serde_json::json!(true)]) {
+                if let Some(confs) = res.get("confirmations").and_then(|c| c.as_i64()) {
+                    if confs > 0 { return true; }
+                }
             }
         }
     }
     false
 }
 
+fn scan_raw_tx_for_preimage(raw_hex: &str, secret_hash_bytes: &[u8]) -> Option<String> {
+    let bytes = hex::decode(raw_hex.trim()).ok()?;
+    if bytes.len() < 32 {
+        return None;
+    }
+    for window in bytes.windows(32) {
+        if sha256_hash(window) == secret_hash_bytes {
+            return Some(hex::encode(window));
+        }
+    }
+    None
+}
+
+fn try_recover_secret_from_chain_or_raw_tx(
+    want_chain: &str,
+    secret_hash_hex: &str,
+    peer_claim_raw_tx: Option<&str>,
+) -> Option<String> {
+    let secret_hash_bytes = hex::decode(secret_hash_hex.trim()).ok()?;
+    if secret_hash_bytes.len() != 32 {
+        return None;
+    }
+
+    if let Some(raw_tx) = peer_claim_raw_tx.filter(|s| !s.trim().is_empty()) {
+        if let Some(sec) = scan_raw_tx_for_preimage(raw_tx, &secret_hash_bytes) {
+            return Some(sec);
+        }
+    }
+
+    let is_rvn = want_chain.eq_ignore_ascii_case("rvn") || want_chain.eq_ignore_ascii_case("ravencoin");
+    if is_rvn {
+        if let Ok(mempool) = rvn_rpc::call_rvn_rpc("getrawmempool", &[serde_json::json!(false)]) {
+            if let Some(txids) = mempool.as_array() {
+                for txid_val in txids.iter().take(40) {
+                    if let Some(txid) = txid_val.as_str() {
+                        if let Some(raw_hex) = get_raw_tx_hex("rvn", txid) {
+                            if let Some(sec) = scan_raw_tx_for_preimage(&raw_hex, &secret_hash_bytes) {
+                                return Some(sec);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Ok(mempool) = rpc::call_rpc("getrawmempool", &[serde_json::json!(false)]) {
+        if let Some(txids) = mempool.as_array() {
+            for txid_val in txids.iter().take(40) {
+                if let Some(txid) = txid_val.as_str() {
+                    if let Some(raw_hex) = get_raw_tx_hex("hemp", txid) {
+                        if let Some(sec) = scan_raw_tx_for_preimage(&raw_hex, &secret_hash_bytes) {
+                            return Some(sec);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Check the status of a swap.
 #[tauri::command]
 pub async fn swap_status(swap_id: String) -> Result<SwapStatus, String> {
-    let (record, offer_txid, accept_txid, offer_chain, want_chain) = {
-        let store = swap_store().lock().map_err(|_| "Swap store lock poisoned")?;
-        let rec = store
-            .get(&swap_id)
-            .ok_or_else(|| format!("Swap not found: {swap_id}"))?
-            .clone();
-        let off_tx = rec.offer.htlc_txid.clone();
-        let acc_tx = rec.acceptance.as_ref().map(|a| a.accept_htlc_txid.clone()).unwrap_or_default();
-        let off_ch = rec.offer.offer_chain.clone();
-        let wt_ch = rec.offer.want_chain.clone();
-        (rec, off_tx, acc_tx, off_ch, wt_ch)
-    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let (record, offer_txid, accept_txid, offer_chain, want_chain) = {
+            let store = swap_store().lock().map_err(|_| "Swap store lock poisoned")?;
+            let rec = store
+                .get(&swap_id)
+                .ok_or_else(|| format!("Swap not found: {swap_id}"))?
+                .clone();
+            let off_tx = rec.offer.htlc_txid.clone();
+            let acc_tx = rec.acceptance.as_ref().map(|a| a.accept_htlc_txid.clone()).unwrap_or_default();
+            let off_ch = rec.offer.offer_chain.clone();
+            let wt_ch = rec.offer.want_chain.clone();
+            (rec, off_tx, acc_tx, off_ch, wt_ch)
+        };
 
-    let offer_htlc_confirmed = is_htlc_tx_confirmed(&offer_chain, &offer_txid);
-    let accept_htlc_confirmed = is_htlc_tx_confirmed(&want_chain, &accept_txid);
+        let already_settled = record.phase == "claimed" || record.phase == "completed";
+        let offer_htlc_confirmed = already_settled || is_htlc_tx_confirmed(&offer_chain, &offer_txid);
+        let accept_htlc_confirmed = already_settled || is_htlc_tx_confirmed(&want_chain, &accept_txid);
 
-    Ok(SwapStatus {
-        swap_id: swap_id.clone(),
-        phase: record.phase.clone(),
-        offer_chain: record.offer.offer_chain.clone(),
-        offer_amount: record.offer.offer_amount,
-        offer_asset: record.offer.offer_asset.clone(),
-        offer_address: record.offer.offer_address.clone(),
-        want_chain: record.offer.want_chain.clone(),
-        want_amount: record.offer.want_amount,
-        want_asset: record.offer.want_asset.clone(),
-        want_address: record.offer.want_address.clone(),
-        offer_htlc_funded: !record.offer.htlc_txid.is_empty(),
-        offer_htlc_confirmed,
-        accept_htlc_funded: record
-            .acceptance
-            .as_ref()
-            .map(|a| !a.accept_htlc_txid.is_empty())
-            .unwrap_or(false),
-        accept_htlc_confirmed,
-        secret_revealed: record.phase == "claimed" || record.phase == "completed",
-        completed: record.phase == "completed",
-        error: None,
-        created_at: record.offer.created_at,
-        updated_at: record.updated_at,
-    })
-}
-
-/// List all swaps.
-#[tauri::command]
-pub async fn swap_list() -> Result<Vec<SwapSummary>, String> {
-    let store = swap_store().lock().map_err(|_| "Swap store lock poisoned")?;
-    let mut swaps: Vec<SwapSummary> = store
-        .values()
-        .map(|record| SwapSummary {
-            swap_id: record.offer.swap_id.clone(),
+        Ok(SwapStatus {
+            swap_id: swap_id.clone(),
             phase: record.phase.clone(),
-            offer_code: record.offer.offer_code.clone(),
             offer_chain: record.offer.offer_chain.clone(),
             offer_amount: record.offer.offer_amount,
             offer_asset: record.offer.offer_asset.clone(),
@@ -1274,7 +1308,68 @@ pub async fn swap_list() -> Result<Vec<SwapSummary>, String> {
             want_amount: record.offer.want_amount,
             want_asset: record.offer.want_asset.clone(),
             want_address: record.offer.want_address.clone(),
+            offer_htlc_funded: !record.offer.htlc_txid.is_empty(),
+            offer_htlc_confirmed,
+            accept_htlc_funded: record
+                .acceptance
+                .as_ref()
+                .map(|a| !a.accept_htlc_txid.is_empty())
+                .unwrap_or(false),
+            accept_htlc_confirmed,
+            secret_revealed: already_settled,
+            completed: record.phase == "completed",
+            error: None,
             created_at: record.offer.created_at,
+            updated_at: record.updated_at,
+        })
+    })
+    .await
+    .map_err(|e| format!("Swap status task failed: {e}"))?
+}
+
+/// List all swaps.
+#[tauri::command]
+pub async fn swap_list() -> Result<Vec<SwapSummary>, String> {
+    let store = swap_store().lock().map_err(|_| "Swap store lock poisoned")?;
+    let mut swaps: Vec<SwapSummary> = store
+        .values()
+        .map(|record| {
+            let is_init = record_is_initiator(record);
+            let accept_code = record.acceptance.as_ref().map(|acc| {
+                let accept_data = serde_json::json!({
+                    "swap_id": record.offer.swap_id,
+                    "accept_htlc_address": acc.accept_htlc_address,
+                    "accept_htlc_txid": acc.accept_htlc_txid,
+                    "accept_htlc_raw_tx": record.accept_htlc_raw_tx,
+                    "accept_offer_address": acc.acceptor_refund_address.clone().unwrap_or_else(|| acc.want_address.clone()),
+                    "acceptor_want_address": acc.want_address,
+                    "accept_locktime": acc.accept_locktime,
+                });
+                base64::prelude::BASE64_STANDARD.encode(accept_data.to_string().as_bytes())
+            });
+            let revealed_secret = if record.phase == "claimed" || record.phase == "completed" {
+                record.secret.clone()
+            } else {
+                None
+            };
+            SwapSummary {
+                swap_id: record.offer.swap_id.clone(),
+                phase: record.phase.clone(),
+                is_initiator: is_init,
+                offer_code: record.offer.offer_code.clone(),
+                accept_code,
+                secret: revealed_secret,
+                claim_raw_tx: record.claim_raw_tx.clone(),
+                offer_chain: record.offer.offer_chain.clone(),
+                offer_amount: record.offer.offer_amount,
+                offer_asset: record.offer.offer_asset.clone(),
+                offer_address: record.offer.offer_address.clone(),
+                want_chain: record.offer.want_chain.clone(),
+                want_amount: record.offer.want_amount,
+                want_asset: record.offer.want_asset.clone(),
+                want_address: record.offer.want_address.clone(),
+                created_at: record.offer.created_at,
+            }
         })
         .collect();
 
@@ -1333,8 +1428,18 @@ pub async fn swap_claim(
             record.secret = Some(s.clone());
             persist_swap_store(&store)?;
             s
+        } else if let Some(s) = record.secret.clone().filter(|s| !s.is_empty()) {
+            s
+        } else if let Some(recovered) = try_recover_secret_from_chain_or_raw_tx(
+            &record.offer.want_chain,
+            &record.offer.secret_hash,
+            peer_claim_raw_tx.as_deref(),
+        ) {
+            record.secret = Some(recovered.clone());
+            persist_swap_store(&store)?;
+            recovered
         } else {
-            record.secret.clone().ok_or_else(|| "Acceptor must provide the secret to claim".to_string())?
+            return Err("Acceptor must provide the secret to claim".to_string());
         };
 
         let secret_bytes = hex::decode(&secret_hex)
@@ -1350,7 +1455,6 @@ pub async fn swap_claim(
         let htlc_txid;
         let htlc_address;
         let htlc_script;
-        let expected_amount;
         let raw_htlc_opt;
 
         if is_initiator {
@@ -1359,7 +1463,6 @@ pub async fn swap_claim(
             claim_to_address = record.offer.want_address.clone();
             htlc_txid = acceptance.accept_htlc_txid.clone();
             htlc_address = acceptance.accept_htlc_address.clone();
-            expected_amount = record.offer.want_amount;
             raw_htlc_opt = record.accept_htlc_raw_tx.clone();
             
             // Reconstruct acceptor's HTLC script:
@@ -1389,7 +1492,6 @@ pub async fn swap_claim(
             claim_to_address = acceptance.want_address.clone();
             htlc_txid = record.offer.htlc_txid.clone();
             htlc_address = record.offer.htlc_address.clone();
-            expected_amount = record.offer.offer_amount;
             raw_htlc_opt = record.htlc_raw_tx.clone();
 
             // Reconstruct initiator's HTLC script:
@@ -1416,11 +1518,9 @@ pub async fn swap_claim(
 
         // 1. Find the UTXO (uses raw HTLC tx decoding first so unsynced nodes never stall)
         let (vout, amount, _) = if claim_chain == "hemp" {
-            hemp_find_utxo(&htlc_txid, &htlc_address, raw_htlc_opt.as_deref())
-                .unwrap_or((0, expected_amount, String::new()))
+            hemp_find_utxo(&htlc_txid, &htlc_address, raw_htlc_opt.as_deref())?
         } else {
-            rvn_find_utxo(&htlc_txid, &htlc_address, raw_htlc_opt.as_deref())
-                .unwrap_or((0, expected_amount, String::new()))
+            rvn_find_utxo(&htlc_txid, &htlc_address, raw_htlc_opt.as_deref())?
         };
 
         // 2. Build the transaction output
@@ -1614,7 +1714,7 @@ pub async fn swap_refund(swap_id: String) -> Result<String, String> {
         if amount <= fee {
             return Err("Amount too small to cover fee".to_string());
         }
-        let send_amount = amount - fee;
+        let send_amount = ((amount - fee) * 100_000_000.0).round() / 100_000_000.0;
 
         let outputs = serde_json::json!({refund_to_address.clone(): send_amount});
         let inputs_val = serde_json::json!([{"txid": htlc_txid, "vout": vout, "sequence": 4294967294u32}]); // 0xfffffffe enables nLockTime but disables BIP68

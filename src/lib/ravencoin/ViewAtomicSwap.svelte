@@ -2,7 +2,7 @@
     import { onMount } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
     import { activeSwaps, swapWizardState } from '../stores/swapStores.js';
-    import { nostrState, publishOffer, publishHandshakeAccept, syncLocalIntentOffers, removeLocalOffer, publishOfferCancelled, requestImmediateRelayPoll } from '../stores/nostrStore.js';
+    import { nostrState, publishOffer, publishHandshakeAccept, publishSecretReveal, syncLocalIntentOffers, removeLocalOffer, publishOfferCancelled, requestImmediateRelayPoll } from '../stores/nostrStore.js';
     import { addToastNotification } from '../stores/notifications.js';
 
     let loadError = null;
@@ -134,7 +134,7 @@
             const hempRes = await invoke('get_receive_addresses', { showChange: false });
             myHempAddresses = Array.isArray(hempRes) ? hempRes.map(a => a.address) : [];
             if (myHempAddresses.length === 0) {
-                const newHemp = await invoke('get_new_address');
+                const newHemp = await invoke('new_address', { label: null });
                 if (newHemp) myHempAddresses = [newHemp];
             }
         } catch(e) { console.warn("Failed to load hemp addresses", e); }
@@ -317,6 +317,13 @@
             loadError = null;
             requestImmediateRelayPoll();
             const res = await invoke('swap_claim', { swapId, providedSecret: null, peerClaimRawTx: null });
+            const secretMatch = String(res || "").match(/([a-f0-9]{64})$/i);
+            const rawTxMatch = String(res || "").match(/CLAIM_RAW_TX:([a-f0-9]+)/i);
+            if (secretMatch && secretMatch[1]) {
+                try {
+                    await publishSecretReveal("", "", swapId, secretMatch[1], rawTxMatch ? rawTxMatch[1] : null);
+                } catch {}
+            }
             addToastNotification("Swap claimed automatically!", "success");
             loadSwaps();
         } catch (e) {
@@ -582,8 +589,20 @@
                                     {swap.phase === 'handshake' ? 'negotiating' : swap.phase === 'accepted' ? 'auto-executing' : swap.phase}
                                 </span>
                             </td>
-                            <td>{swap.offer_amount} {swap.offer_asset || (swap.offer_chain === 'rvn' ? 'RVN' : 'HEMP')}</td>
-                            <td>{swap.want_amount} {swap.want_asset || (swap.want_chain === 'rvn' ? 'RVN' : 'HEMP')}</td>
+                            <td>
+                                {#if swap.is_initiator === false || swap.phase === 'handshake'}
+                                    {swap.want_amount} {swap.want_asset || (swap.want_chain === 'rvn' ? 'RVN' : 'HEMP')}
+                                {:else}
+                                    {swap.offer_amount} {swap.offer_asset || (swap.offer_chain === 'rvn' ? 'RVN' : 'HEMP')}
+                                {/if}
+                            </td>
+                            <td>
+                                {#if swap.is_initiator === false || swap.phase === 'handshake'}
+                                    {swap.offer_amount} {swap.offer_asset || (swap.offer_chain === 'rvn' ? 'RVN' : 'HEMP')}
+                                {:else}
+                                    {swap.want_amount} {swap.want_asset || (swap.want_chain === 'rvn' ? 'RVN' : 'HEMP')}
+                                {/if}
+                            </td>
                             <td>{new Date(swap.created_at * 1000).toLocaleString()}</td>
                             <td style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
                                 {#if swap.phase === 'handshake'}

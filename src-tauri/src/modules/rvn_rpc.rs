@@ -499,7 +499,7 @@ fn rvn_rpc_dashboard_blocking() -> Result<RvnDashboardData, String> {
         let cache_mutex = RVN_SYNC_DASHBOARD_CACHE.get_or_init(|| std::sync::Mutex::new(None));
         if let Ok(guard) = cache_mutex.lock() {
             if let Some((ts, ref cached_info, ref cached_tx)) = *guard {
-                if ts.elapsed() < Duration::from_secs(18) {
+                if ts.elapsed() < Duration::from_secs(8) {
                     let mut info = cached_info.clone();
                     if let Some(obj) = info.as_object_mut() {
                         obj.insert("blocks".to_string(), serde_json::json!(b));
